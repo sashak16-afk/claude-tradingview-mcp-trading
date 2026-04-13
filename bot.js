@@ -17,7 +17,7 @@ import { execSync } from "child_process";
 // ─── Onboarding ───────────────────────────────────────────────────────────────
 
 function checkOnboarding() {
-  const required = ["BITGET_API_KEY", "BITGET_SECRET_KEY", "BITGET_PASSPHRASE"];
+  const required = ["KRAKEN_API_KEY", "KRAKEN_API_SECRET"];
   const missing = required.filter((k) => !process.env[k]);
 
   if (!existsSync(".env")) {
@@ -27,17 +27,16 @@ function checkOnboarding() {
     writeFileSync(
       ".env",
       [
-        "# BitGet credentials",
-        "BITGET_API_KEY=",
-        "BITGET_SECRET_KEY=",
-        "BITGET_PASSPHRASE=",
+        "# Kraken credentials",
+        "KRAKEN_API_KEY=",
+        "KRAKEN_API_SECRET=",
         "",
         "# Trading config",
         "PORTFOLIO_VALUE_USD=1000",
         "MAX_TRADE_SIZE_USD=100",
         "MAX_TRADES_PER_DAY=3",
         "PAPER_TRADING=true",
-        "SYMBOL=BTCUSDT",
+        "SYMBOLS=XBTUSDT,ETHUSDT,SOLUSDT,XRPUSDT,BNBUSDT,XDGUSDT,LINKUSDT",
         "TIMEFRAME=4H",
       ].join("\n") + "\n",
     );
@@ -45,7 +44,7 @@ function checkOnboarding() {
       execSync("open .env");
     } catch {}
     console.log(
-      "Fill in your BitGet credentials in .env then re-run: node bot.js\n",
+      "Fill in your Kraken credentials in .env then re-run: node bot.js\n",
     );
     process.exit(0);
   }
@@ -72,18 +71,18 @@ function checkOnboarding() {
 // ─── Config ────────────────────────────────────────────────────────────────
 
 const CONFIG = {
-  symbol: process.env.SYMBOL || "BTCUSDT",
+  symbols: process.env.SYMBOLS
+    ? process.env.SYMBOLS.split(",").map((s) => s.trim()).filter(Boolean)
+    : [process.env.SYMBOL || "BTCUSDT"],
   timeframe: process.env.TIMEFRAME || "4H",
   portfolioValue: parseFloat(process.env.PORTFOLIO_VALUE_USD || "1000"),
-  maxTradeSizeUSD: parseFloat(process.env.MAX_TRADE_SIZE_USD || "100"),
+  maxTradeSizeAUD: parseFloat(process.env.MAX_TRADE_SIZE_AUD || process.env.MAX_TRADE_SIZE_USD || "100"),
   maxTradesPerDay: parseInt(process.env.MAX_TRADES_PER_DAY || "3"),
   paperTrading: process.env.PAPER_TRADING !== "false",
-  tradeMode: process.env.TRADE_MODE || "spot",
-  bitget: {
-    apiKey: process.env.BITGET_API_KEY,
-    secretKey: process.env.BITGET_SECRET_KEY,
-    passphrase: process.env.BITGET_PASSPHRASE,
-    baseUrl: process.env.BITGET_BASE_URL || "https://api.bitget.com",
+  kraken: {
+    apiKey: process.env.KRAKEN_API_KEY,
+    apiSecret: process.env.KRAKEN_API_SECRET,
+    baseUrl: "https://api.kraken.com",
   },
 };
 
@@ -100,11 +99,61 @@ function saveLog(log) {
   writeFileSync(LOG_FILE, JSON.stringify(log, null, 2));
 }
 
+// ─── Position Management ─────────────────────────────────────────────────────
+
+function getPosition(log, symbol) {
+  return (log.positions || []).find((p) => p.symbol === symbol) || null;
+}
+
+function addPosition(log, position) {
+  if (!log.positions) log.positions = [];
+  log.positions = log.positions.filter((p) => p.symbol !== position.symbol);
+  log.positions.push(position);
+}
+
+function removePosition(log, symbol) {
+  if (!log.positions) return;
+  log.positions = log.positions.filter((p) => p.symbol !== symbol);
+}
+
 function countTodaysTrades(log) {
   const today = new Date().toISOString().slice(0, 10);
   return log.trades.filter(
     (t) => t.timestamp.startsWith(today) && t.orderPlaced,
   ).length;
+}
+
+// ─── Kraken → Binance symbol map (candle data comes from Binance public API) ──
+// Kraken uses different naming (XBT, XDG) and AUD pairs; Binance uses USDT.
+
+const BINANCE_SYMBOL_MAP = {
+  XBTAUD:  "BTCUSDT",
+  ETHAUD:  "ETHUSDT",
+  SOLAUD:  "SOLUSDT",
+  XRPAUD:  "XRPUSDT",
+  XDGAUD:  "DOGEUSDT",
+  LINKAUD: "LINKUSDT",
+  // USDT pairs kept as fallback
+  XBTUSDT:  "BTCUSDT",
+  XDGUSDT:  "DOGEUSDT",
+};
+
+function toBinanceSymbol(krakenSymbol) {
+  return BINANCE_SYMBOL_MAP[krakenSymbol] || krakenSymbol;
+}
+
+// ─── Kraken live price (AUD) — used for order sizing and P&L ────────────────
+
+async function fetchKrakenPrice(symbol) {
+  const res = await fetch(
+    `https://api.kraken.com/0/public/Ticker?pair=${symbol}`
+  );
+  const data = await res.json();
+  if (data.error && data.error.length > 0) {
+    throw new Error(`Kraken ticker error: ${data.error.join(", ")}`);
+  }
+  const ticker = Object.values(data.result)[0];
+  return parseFloat(ticker.c[0]); // last trade close price
 }
 
 // ─── Market Data (Binance public API — free, no auth) ───────────────────────
@@ -164,6 +213,18 @@ function calcRSI(closes, period = 14) {
   if (avgLoss === 0) return 100;
   const rs = avgGain / avgLoss;
   return 100 - 100 / (1 + rs);
+}
+
+function calcATR(candles, period = 14) {
+  if (candles.length < period + 1) return null;
+  const trs = [];
+  for (let i = 1; i < candles.length; i++) {
+    const { high, low } = candles[i];
+    const prevClose = candles[i - 1].close;
+    trs.push(Math.max(high - low, Math.abs(high - prevClose), Math.abs(low - prevClose)));
+  }
+  const recent = trs.slice(-period);
+  return recent.reduce((a, b) => a + b, 0) / period;
 }
 
 // VWAP — session-based, resets at midnight UTC
@@ -278,6 +339,36 @@ function runSafetyCheck(price, ema8, vwap, rsi3, rules) {
   return { results, allPass };
 }
 
+// ─── Exit Conditions ─────────────────────────────────────────────────────────
+
+function checkExitConditions(position, price, ema8, vwap) {
+  const reasons = [];
+
+  console.log("\n── Exit Check ───────────────────────────────────────────\n");
+  console.log(`  Entry:       $${position.entryPrice.toFixed(4)}`);
+  console.log(`  Current:     $${price.toFixed(4)}`);
+  console.log(`  Stop-loss:   $${position.stopLoss.toFixed(4)}`);
+  console.log(`  Take-profit: $${position.takeProfit.toFixed(4)}`);
+
+  if (price <= position.stopLoss) {
+    reasons.push(`Stop-loss hit (${price.toFixed(4)} ≤ ${position.stopLoss.toFixed(4)})`);
+  }
+  if (price >= position.takeProfit) {
+    reasons.push(`Take-profit hit (${price.toFixed(4)} ≥ ${position.takeProfit.toFixed(4)})`);
+  }
+  if (price < vwap && price < ema8) {
+    reasons.push(`Trend exit — bearish flip (price below VWAP and EMA8)`);
+  }
+
+  if (reasons.length === 0) {
+    console.log(`  📊 Holding — no exit condition triggered`);
+  } else {
+    reasons.forEach((r) => console.log(`  🚨 ${r}`));
+  }
+
+  return { shouldExit: reasons.length > 0, reasons };
+}
+
 // ─── Trade Limits ────────────────────────────────────────────────────────────
 
 function checkTradeLimits(log) {
@@ -301,70 +392,57 @@ function checkTradeLimits(log) {
     CONFIG.maxTradeSizeUSD,
   );
 
-  if (tradeSize > CONFIG.maxTradeSizeUSD) {
+  if (tradeSize > CONFIG.maxTradeSizeAUD) {
     console.log(
-      `🚫 Trade size $${tradeSize.toFixed(2)} exceeds max $${CONFIG.maxTradeSizeUSD}`,
+      `🚫 Trade size $${tradeSize.toFixed(2)} AUD exceeds max $${CONFIG.maxTradeSizeAUD} AUD`,
     );
     return false;
   }
 
   console.log(
-    `✅ Trade size: $${tradeSize.toFixed(2)} — within max $${CONFIG.maxTradeSizeUSD}`,
+    `✅ Trade size: $${tradeSize.toFixed(2)} AUD — within max $${CONFIG.maxTradeSizeAUD} AUD`,
   );
 
   return true;
 }
 
-// ─── BitGet Execution ────────────────────────────────────────────────────────
+// ─── Kraken Execution ────────────────────────────────────────────────────────
 
-function signBitGet(timestamp, method, path, body = "") {
-  const message = `${timestamp}${method}${path}${body}`;
-  return crypto
-    .createHmac("sha256", CONFIG.bitget.secretKey)
-    .update(message)
-    .digest("base64");
+function signKraken(path, nonce, postData) {
+  const secret = Buffer.from(CONFIG.kraken.apiSecret, "base64");
+  const hash = crypto.createHash("sha256").update(nonce + postData).digest("binary");
+  return crypto.createHmac("sha512", secret).update(path + hash, "binary").digest("base64");
 }
 
-async function placeBitGetOrder(symbol, side, sizeUSD, price) {
-  const quantity = (sizeUSD / price).toFixed(6);
-  const timestamp = Date.now().toString();
-  const path =
-    CONFIG.tradeMode === "spot"
-      ? "/api/v2/spot/trade/placeOrder"
-      : "/api/v2/mix/order/placeOrder";
+async function placeKrakenOrder(symbol, side, volume) {
+  const path = "/0/private/AddOrder";
+  const nonce = Date.now().toString();
+  const postData = new URLSearchParams({
+    nonce,
+    pair: symbol,
+    type: side,
+    ordertype: "market",
+    volume: parseFloat(volume).toFixed(8),
+  }).toString();
 
-  const body = JSON.stringify({
-    symbol,
-    side,
-    orderType: "market",
-    quantity,
-    ...(CONFIG.tradeMode === "futures" && {
-      productType: "USDT-FUTURES",
-      marginMode: "isolated",
-      marginCoin: "USDT",
-    }),
-  });
+  const signature = signKraken(path, nonce, postData);
 
-  const signature = signBitGet(timestamp, "POST", path, body);
-
-  const res = await fetch(`${CONFIG.bitget.baseUrl}${path}`, {
+  const res = await fetch(`${CONFIG.kraken.baseUrl}${path}`, {
     method: "POST",
     headers: {
-      "Content-Type": "application/json",
-      "ACCESS-KEY": CONFIG.bitget.apiKey,
-      "ACCESS-SIGN": signature,
-      "ACCESS-TIMESTAMP": timestamp,
-      "ACCESS-PASSPHRASE": CONFIG.bitget.passphrase,
+      "Content-Type": "application/x-www-form-urlencoded",
+      "API-Key": CONFIG.kraken.apiKey,
+      "API-Sign": signature,
     },
-    body,
+    body: postData,
   });
 
   const data = await res.json();
-  if (data.code !== "00000") {
-    throw new Error(`BitGet order failed: ${data.msg}`);
+  if (data.error && data.error.length > 0) {
+    throw new Error(`Kraken order failed: ${data.error.join(", ")}`);
   }
 
-  return data.data;
+  return { orderId: data.result.txid[0] };
 }
 
 // ─── Tax CSV Logging ─────────────────────────────────────────────────────────
@@ -411,7 +489,19 @@ function writeTradeCsv(logEntry) {
   let mode = "";
   let notes = "";
 
-  if (!logEntry.allPass) {
+  if (logEntry.side === "sell") {
+    side = "SELL";
+    quantity = logEntry.quantity.toFixed(8);
+    totalUSD = logEntry.totalAUD.toFixed(2);
+    fee = (logEntry.totalAUD * 0.001).toFixed(4);
+    netAmount = (logEntry.totalAUD - parseFloat(fee)).toFixed(2);
+    orderId = logEntry.orderId || "";
+    mode = logEntry.paperTrading ? "PAPER" : "LIVE";
+    const pnlStr = `${logEntry.pnl >= 0 ? "+" : ""}${logEntry.pnl.toFixed(2)} AUD`;
+    notes = logEntry.error
+      ? `Error: ${logEntry.error}`
+      : `P&L: ${pnlStr} | ${logEntry.exitReasons.join("; ")}`;
+  } else if (!logEntry.allPass) {
     const failed = logEntry.conditions
       .filter((c) => !c.pass)
       .map((c) => c.label)
@@ -419,30 +509,23 @@ function writeTradeCsv(logEntry) {
     mode = "BLOCKED";
     orderId = "BLOCKED";
     notes = `Failed: ${failed}`;
-  } else if (logEntry.paperTrading) {
-    side = "BUY";
-    quantity = (logEntry.tradeSize / logEntry.price).toFixed(6);
-    totalUSD = logEntry.tradeSize.toFixed(2);
-    fee = (logEntry.tradeSize * 0.001).toFixed(4);
-    netAmount = (logEntry.tradeSize - parseFloat(fee)).toFixed(2);
-    orderId = logEntry.orderId || "";
-    mode = "PAPER";
-    notes = "All conditions met";
   } else {
     side = "BUY";
-    quantity = (logEntry.tradeSize / logEntry.price).toFixed(6);
+    quantity = logEntry.quantity.toFixed(8);
     totalUSD = logEntry.tradeSize.toFixed(2);
     fee = (logEntry.tradeSize * 0.001).toFixed(4);
     netAmount = (logEntry.tradeSize - parseFloat(fee)).toFixed(2);
     orderId = logEntry.orderId || "";
-    mode = "LIVE";
-    notes = logEntry.error ? `Error: ${logEntry.error}` : "All conditions met";
+    mode = logEntry.paperTrading ? "PAPER" : "LIVE";
+    notes = logEntry.error
+      ? `Error: ${logEntry.error}`
+      : `SL: ${logEntry.stopLoss.toFixed(4)} | TP: ${logEntry.takeProfit.toFixed(4)} | ATR: ${logEntry.indicators.atr.toFixed(4)}`;
   }
 
   const row = [
     date,
     time,
-    "BitGet",
+    "Kraken",
     logEntry.symbol,
     side,
     quantity,
@@ -491,6 +574,181 @@ function generateTaxSummary() {
   console.log("─────────────────────────────────────────────────────────\n");
 }
 
+// ─── Per-symbol evaluation ───────────────────────────────────────────────────
+
+async function evaluateSymbol(symbol, log, rules) {
+  console.log(`\n── ${symbol} ─────────────────────────────────────────────\n`);
+
+  // Fetch candle data from Binance (indicators — currency-agnostic signals)
+  let candles;
+  try {
+    candles = await fetchCandles(toBinanceSymbol(symbol), CONFIG.timeframe, 500);
+  } catch (err) {
+    console.log(`  ⚠️  Failed to fetch candle data for ${symbol}: ${err.message}`);
+    return;
+  }
+
+  // Fetch live AUD price from Kraken — used for order sizing and P&L only
+  let audPrice;
+  try {
+    audPrice = await fetchKrakenPrice(symbol);
+  } catch (err) {
+    console.log(`  ⚠️  Failed to fetch Kraken AUD price for ${symbol}: ${err.message}`);
+    return;
+  }
+
+  const closes = candles.map((c) => c.close);
+  const usdtPrice = closes[closes.length - 1]; // used for indicator signals only
+
+  const ema8 = calcEMA(closes, 8);
+  const vwap = calcVWAP(candles);
+  const rsi3 = calcRSI(closes, 3);
+  const atr  = calcATR(candles, 14);
+
+  console.log(`  Kraken price (AUD): $${audPrice.toFixed(4)}`);
+  console.log(`  Binance price (USDT): $${usdtPrice.toFixed(4)} — used for indicators only`);
+  console.log(`  EMA(8):  $${ema8.toFixed(4)}`);
+  console.log(`  VWAP:    $${vwap ? vwap.toFixed(4) : "N/A"}`);
+  console.log(`  RSI(3):  ${rsi3 ? rsi3.toFixed(2) : "N/A"}`);
+  console.log(`  ATR(14): $${atr ? atr.toFixed(4) : "N/A"}`);
+
+  if (!vwap || !rsi3 || !atr) {
+    console.log(`  ⚠️  Not enough data to calculate indicators. Skipping.`);
+    return;
+  }
+
+  // ── EXIT: check open position first ───────────────────────────────────────
+  const position = getPosition(log, symbol);
+
+  if (position) {
+    const { shouldExit, reasons } = checkExitConditions(position, usdtPrice, ema8, vwap);
+
+    if (!shouldExit) return null;
+
+    // Close the position — P&L in AUD using Kraken live price
+    const totalAUD = position.quantity * audPrice;
+    const pnl = (audPrice - position.entryPriceAUD) * position.quantity;
+    const logEntry = {
+      timestamp: new Date().toISOString(),
+      symbol,
+      side: "sell",
+      price,
+      quantity: position.quantity,
+      totalAUD,
+      pnl,
+      exitReasons: reasons,
+      orderPlaced: false,
+      orderId: null,
+      paperTrading: CONFIG.paperTrading,
+    };
+
+    console.log("\n── Decision ─────────────────────────────────────────────\n");
+
+    if (CONFIG.paperTrading) {
+      console.log(`\n📋 PAPER SELL — ${symbol} qty ${position.quantity} ~$${totalAUD.toFixed(2)} AUD`);
+      console.log(`   P&L: ${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)} AUD`);
+      logEntry.orderPlaced = true;
+      logEntry.orderId = `PAPER-${Date.now()}`;
+    } else {
+      console.log(`\n🔴 PLACING SELL ORDER — ${position.quantity} ${symbol} (~$${totalAUD.toFixed(2)} AUD)`);
+      try {
+        const order = await placeKrakenOrder(symbol, "sell", position.quantity);
+        logEntry.orderPlaced = true;
+        logEntry.orderId = order.orderId;
+        console.log(`✅ SELL ORDER PLACED — ${order.orderId} | P&L: ${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)} AUD`);
+      } catch (err) {
+        console.log(`❌ SELL ORDER FAILED — ${err.message}`);
+        logEntry.error = err.message;
+      }
+    }
+
+    if (logEntry.orderPlaced) removePosition(log, symbol);
+    log.trades.push(logEntry);
+    writeTradeCsv(logEntry);
+    return logEntry;
+  }
+
+  // ── ENTRY: no open position — check buy conditions ────────────────────────
+  const { results, allPass } = runSafetyCheck(usdtPrice, ema8, vwap, rsi3, rules);
+
+  const tradeSize = Math.min(CONFIG.portfolioValue * 0.01, CONFIG.maxTradeSizeAUD);
+  const quantity = tradeSize / audPrice; // volume sized in AUD
+
+  // ATR-based stops use USDT ATR as a % of price, applied to AUD price
+  const atrPct     = atr / usdtPrice;
+  const stopLoss   = usdtPrice - atr * 1.5;       // USDT — for signal comparison
+  const takeProfit = usdtPrice + atr * 2.5;       // USDT — for signal comparison
+  const stopLossAUD   = audPrice * (1 - atrPct * 1.5);  // AUD — for logging
+  const takeProfitAUD = audPrice * (1 + atrPct * 2.5);  // AUD — for logging
+
+  console.log("\n── Decision ─────────────────────────────────────────────\n");
+
+  const logEntry = {
+    timestamp: new Date().toISOString(),
+    symbol,
+    side: "buy",
+    timeframe: CONFIG.timeframe,
+    price: audPrice,
+    indicators: { ema8, vwap, rsi3, atr },
+    conditions: results,
+    allPass,
+    tradeSize,
+    quantity,
+    stopLoss,
+    takeProfit,
+    stopLossAUD,
+    takeProfitAUD,
+    orderPlaced: false,
+    orderId: null,
+    paperTrading: CONFIG.paperTrading,
+  };
+
+  if (!allPass) {
+    const failed = results.filter((r) => !r.pass).map((r) => r.label);
+    console.log(`🚫 TRADE BLOCKED`);
+    failed.forEach((f) => console.log(`   - ${f}`));
+  } else {
+    console.log(`✅ ALL CONDITIONS MET`);
+    console.log(`   Stop-loss:   $${stopLossAUD.toFixed(4)} AUD (1.5× ATR)`);
+    console.log(`   Take-profit: $${takeProfitAUD.toFixed(4)} AUD (2.5× ATR)`);
+
+    if (CONFIG.paperTrading) {
+      console.log(`\n📋 PAPER TRADE — would buy ${symbol} qty ${quantity.toFixed(8)} ~$${tradeSize.toFixed(2)} AUD @ $${audPrice.toFixed(4)} AUD`);
+      logEntry.orderPlaced = true;
+      logEntry.orderId = `PAPER-${Date.now()}`;
+    } else {
+      console.log(`\n🔴 PLACING BUY ORDER — ${quantity.toFixed(8)} ${symbol} (~$${tradeSize.toFixed(2)} AUD @ $${audPrice.toFixed(4)} AUD)`);
+      try {
+        const order = await placeKrakenOrder(symbol, "buy", quantity);
+        logEntry.orderPlaced = true;
+        logEntry.orderId = order.orderId;
+        console.log(`✅ BUY ORDER PLACED — ${order.orderId}`);
+      } catch (err) {
+        console.log(`❌ BUY ORDER FAILED — ${err.message}`);
+        logEntry.error = err.message;
+      }
+    }
+
+    if (logEntry.orderPlaced) {
+      addPosition(log, {
+        symbol,
+        entryPrice: usdtPrice,    // USDT — for indicator-based exit signals
+        entryPriceAUD: audPrice,  // AUD  — for P&L calculation
+        quantity,
+        entryTime: logEntry.timestamp,
+        orderId: logEntry.orderId,
+        stopLoss,
+        takeProfit,
+        atrAtEntry: atr,
+      });
+    }
+  }
+
+  log.trades.push(logEntry);
+  writeTradeCsv(logEntry);
+  return logEntry;
+}
+
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 async function run() {
@@ -504,115 +762,25 @@ async function run() {
   );
   console.log("═══════════════════════════════════════════════════════════");
 
-  // Load strategy
   const rules = JSON.parse(readFileSync("rules.json", "utf8"));
   console.log(`\nStrategy: ${rules.strategy.name}`);
-  console.log(`Symbol: ${CONFIG.symbol} | Timeframe: ${CONFIG.timeframe}`);
+  console.log(`Symbols (${CONFIG.symbols.length}): ${CONFIG.symbols.join(", ")} | Timeframe: ${CONFIG.timeframe}`);
 
-  // Load log and check daily limits
   const log = loadLog();
-  const withinLimits = checkTradeLimits(log);
-  if (!withinLimits) {
-    console.log("\nBot stopping — trade limits reached for today.");
-    return;
-  }
 
-  // Fetch candle data — need enough for EMA(8) + full session for VWAP
-  console.log("\n── Fetching market data from Binance ───────────────────\n");
-  const candles = await fetchCandles(CONFIG.symbol, CONFIG.timeframe, 500);
-  const closes = candles.map((c) => c.close);
-  const price = closes[closes.length - 1];
-  console.log(`  Current price: $${price.toFixed(2)}`);
-
-  // Calculate indicators
-  const ema8 = calcEMA(closes, 8);
-  const vwap = calcVWAP(candles);
-  const rsi3 = calcRSI(closes, 3);
-
-  console.log(`  EMA(8):  $${ema8.toFixed(2)}`);
-  console.log(`  VWAP:    $${vwap ? vwap.toFixed(2) : "N/A"}`);
-  console.log(`  RSI(3):  ${rsi3 ? rsi3.toFixed(2) : "N/A"}`);
-
-  if (!vwap || !rsi3) {
-    console.log("\n⚠️  Not enough data to calculate indicators. Exiting.");
-    return;
-  }
-
-  // Run safety check
-  const { results, allPass } = runSafetyCheck(price, ema8, vwap, rsi3, rules);
-
-  // Calculate position size
-  const tradeSize = Math.min(
-    CONFIG.portfolioValue * 0.01,
-    CONFIG.maxTradeSizeUSD,
-  );
-
-  // Decision
-  console.log("\n── Decision ─────────────────────────────────────────────\n");
-
-  const logEntry = {
-    timestamp: new Date().toISOString(),
-    symbol: CONFIG.symbol,
-    timeframe: CONFIG.timeframe,
-    price,
-    indicators: { ema8, vwap, rsi3 },
-    conditions: results,
-    allPass,
-    tradeSize,
-    orderPlaced: false,
-    orderId: null,
-    paperTrading: CONFIG.paperTrading,
-    limits: {
-      maxTradeSizeUSD: CONFIG.maxTradeSizeUSD,
-      maxTradesPerDay: CONFIG.maxTradesPerDay,
-      tradesToday: countTodaysTrades(log),
-    },
-  };
-
-  if (!allPass) {
-    const failed = results.filter((r) => !r.pass).map((r) => r.label);
-    console.log(`🚫 TRADE BLOCKED`);
-    console.log(`   Failed conditions:`);
-    failed.forEach((f) => console.log(`   - ${f}`));
-  } else {
-    console.log(`✅ ALL CONDITIONS MET`);
-
-    if (CONFIG.paperTrading) {
-      console.log(
-        `\n📋 PAPER TRADE — would buy ${CONFIG.symbol} ~$${tradeSize.toFixed(2)} at market`,
-      );
-      console.log(`   (Set PAPER_TRADING=false in .env to place real orders)`);
-      logEntry.orderPlaced = true;
-      logEntry.orderId = `PAPER-${Date.now()}`;
-    } else {
-      console.log(
-        `\n🔴 PLACING LIVE ORDER — $${tradeSize.toFixed(2)} BUY ${CONFIG.symbol}`,
-      );
-      try {
-        const order = await placeBitGetOrder(
-          CONFIG.symbol,
-          "buy",
-          tradeSize,
-          price,
-        );
-        logEntry.orderPlaced = true;
-        logEntry.orderId = order.orderId;
-        console.log(`✅ ORDER PLACED — ${order.orderId}`);
-      } catch (err) {
-        console.log(`❌ ORDER FAILED — ${err.message}`);
-        logEntry.error = err.message;
-      }
+  for (const symbol of CONFIG.symbols) {
+    // Re-check limits before each symbol — stop as soon as daily cap is hit
+    const withinLimits = checkTradeLimits(log);
+    if (!withinLimits) {
+      console.log("\nBot stopping — trade limits reached for today.");
+      break;
     }
+
+    await evaluateSymbol(symbol, log, rules);
   }
 
-  // Save decision log
-  log.trades.push(logEntry);
   saveLog(log);
   console.log(`\nDecision log saved → ${LOG_FILE}`);
-
-  // Write tax CSV row for every run (executed, paper, or blocked)
-  writeTradeCsv(logEntry);
-
   console.log("═══════════════════════════════════════════════════════════\n");
 }
 
