@@ -122,6 +122,11 @@ function toBinanceSymbol(s) {
   return BINANCE_SYMBOL_MAP[s] || s;
 }
 
+// Minimum order volumes enforced by Kraken (in base currency units)
+const KRAKEN_MIN_ORDER = {
+  LINKAUD: 1,    // min 1 LINK (~$12 AUD) — our trade sizes (~$2.50–$5) are too small
+};
+
 // ─── Kraken live price (AUD) ──────────────────────────────────────────────────
 
 async function fetchKrakenPrice(symbol) {
@@ -138,8 +143,12 @@ async function fetchCandles(symbol, interval, limit = 500) {
     "1m":"1m","3m":"3m","5m":"5m","15m":"15m","30m":"30m",
     "1H":"1h","4H":"4h","1D":"1d","1W":"1w",
   };
-  const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${map[interval]||"1h"}&limit=${limit}`;
-  const res = await fetch(url);
+  const ivl = map[interval] || "1h";
+  let res = await fetch(`https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${ivl}&limit=${limit}`);
+  if (!res.ok && res.status === 400) {
+    // api.binance.com may geo-block certain symbols from US-based servers — try Binance.US
+    res = await fetch(`https://api.binance.us/api/v3/klines?symbol=${symbol}&interval=${ivl}&limit=${limit}`);
+  }
   if (!res.ok) throw new Error(`Binance API error: ${res.status}`);
   return (await res.json()).map((k) => ({
     time: k[0],
@@ -667,10 +676,17 @@ async function evaluateSymbol(symbol, log) {
     orderPlaced: false, orderId: null, paperTrading: CONFIG.paperTrading,
   };
 
+  const minQty = KRAKEN_MIN_ORDER[symbol];
+  const belowMinVolume = minQty && quantity < minQty;
+
   if (!allPass) {
     const failed = conditions.filter((r) => !r.pass).map((r) => r.label);
     console.log("🚫 TRADE BLOCKED");
     failed.forEach((f) => console.log(`   - ${f}`));
+  } else if (belowMinVolume) {
+    console.log(`🚫 TRADE BLOCKED — order too small for Kraken minimum`);
+    console.log(`   Calculated: ${quantity.toFixed(4)} (need ≥ ${minQty} for ${symbol})`);
+    console.log(`   Fix: increase portfolio size or remove ${symbol} from SYMBOLS`);
   } else {
     const riskLabel = score >= 7 ? "1.0%" : score >= 6 ? "0.75%" : "0.5%";
     console.log(`✅ ALL CONDITIONS MET — Score: ${score}/7 (${riskLabel} risk)`);
