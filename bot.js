@@ -122,6 +122,30 @@ function toBinanceSymbol(s) {
   return BINANCE_SYMBOL_MAP[s] || s;
 }
 
+// Kraken balance asset codes (used to look up holdings in /Balance response)
+const KRAKEN_BASE = {
+  XBTAUD:  "XXBT",
+  ETHAUD:  "XETH",
+  SOLAUD:  "SOL",
+  XRPAUD:  "XXRP",
+  XDGAUD:  "XXDG",
+  LINKAUD: "LINK",
+  SEIUSD:  "SEI",
+  NEARUSD: "NEAR",
+};
+
+// Short base-currency string used to match pairs in TradesHistory
+const KRAKEN_PAIR_PATTERN = {
+  XBTAUD:  "XBT",
+  ETHAUD:  "ETH",
+  SOLAUD:  "SOL",
+  XRPAUD:  "XRP",
+  XDGAUD:  "XDG",
+  LINKAUD: "LINK",
+  SEIUSD:  "SEI",
+  NEARUSD: "NEAR",
+};
+
 // Minimum order volumes enforced by Kraken (in base currency units)
 const KRAKEN_MIN_ORDER = {
   LINKAUD: 1,    // min 1 LINK (~$12 AUD) — our trade sizes (~$2.50–$5) are too small
@@ -461,6 +485,61 @@ function signKraken(path, nonce, postData) {
   return crypto.createHmac("sha512", secret).update(path + hash, "binary").digest("base64");
 }
 
+async function krakenPrivate(path, params = {}) {
+  const nonce    = Date.now().toString();
+  const postData = new URLSearchParams({ nonce, ...params }).toString();
+  const res = await fetch(`${CONFIG.kraken.baseUrl}${path}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      "API-Key":  CONFIG.kraken.apiKey,
+      "API-Sign": signKraken(path, nonce, postData),
+    },
+    body: postData,
+  });
+  const data = await res.json();
+  if (data.error && data.error.length > 0) throw new Error(data.error.join(", "));
+  return data.result;
+}
+
+// ─── Live Position Lookup (Kraken balance + trade history) ────────────────────
+// Replaces the file-based getPosition() — works across ephemeral Railway runs.
+
+async function getPositionFromKraken(symbol, audPrice, usdtPrice, atr) {
+  const base    = KRAKEN_BASE[symbol];
+  const pattern = KRAKEN_PAIR_PATTERN[symbol];
+  if (!base || !pattern) return null;
+
+  try {
+    // 1. Fetch live balance
+    const balances = await krakenPrivate("/0/private/Balance");
+    const balance  = parseFloat(balances[base] || "0");
+
+    // Ignore dust (worth less than $1 AUD)
+    if (balance * audPrice < 1.0) return null;
+
+    // 2. Find last buy in trade history to reconstruct entry price
+    const history = await krakenPrivate("/0/private/TradesHistory");
+    const trades  = Object.values(history.trades || {});
+    const lastBuy = trades
+      .filter((t) => t.type === "buy" && t.pair.toUpperCase().includes(pattern))
+      .sort((a, b) => b.time - a.time)[0];
+
+    const entryPriceAUD = lastBuy ? parseFloat(lastBuy.price) : audPrice;
+    // Convert AUD entry to USDT using current ratio (for stop/take comparison)
+    const entryPrice  = entryPriceAUD * (usdtPrice / audPrice);
+    const stopLoss    = entryPrice - atr * 1.5;
+    const takeProfit  = entryPrice + atr * 2.5;
+
+    console.log(`  📂 Open position found: ${balance.toFixed(6)} ${pattern} @ $${entryPriceAUD.toFixed(4)} AUD (from Kraken history)`);
+    return { symbol, entryPrice, entryPriceAUD, quantity: balance, stopLoss, takeProfit };
+
+  } catch (err) {
+    console.log(`  ⚠️  Position lookup failed: ${err.message}`);
+    return null;
+  }
+}
+
 async function placeKrakenOrder(symbol, side, volume) {
   const path     = "/0/private/AddOrder";
   const nonce    = Date.now().toString();
@@ -611,8 +690,8 @@ async function evaluateSymbol(symbol, log) {
     return;
   }
 
-  // ── EXIT: check open position first ──────────────────────────────────
-  const position = getPosition(log, symbol);
+  // ── EXIT: check open position first (live Kraken balance lookup) ────
+  const position = await getPositionFromKraken(symbol, audPrice, usdtPrice, atr);
   if (position) {
     const { shouldExit, reasons } = checkExitConditions(position, usdtPrice, ema8, vwap);
     if (!shouldExit) return;
