@@ -20,6 +20,9 @@ function checkOnboarding() {
   const required = ["KRAKEN_API_KEY", "KRAKEN_API_SECRET"];
   const missing = required.filter((k) => !process.env[k]);
 
+  // Railway injects env vars directly — no .env file needed
+  if (missing.length === 0) return;
+
   if (!existsSync(".env")) {
     console.log(
       "\n⚠️  No .env file found — opening it for you to fill in...\n",
