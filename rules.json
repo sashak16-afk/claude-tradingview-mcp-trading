@@ -1,50 +1,171 @@
 {
-  "watchlist": ["BTCUSDT"],
-  "default_timeframe": "1m",
-
   "strategy": {
-    "name": "VWAP + RSI(3) + EMA(8) Scalping Strategy",
-    "sources": ["Lewis Jackson"],
-    "description": "Three indicators, each doing a different job. EMA(8) for trend direction, VWAP for session bias, RSI(3) for entry timing. All three must align before a trade fires."
+    "name": "Blended Confluence Scalper — Jackson + Multi-Indicator",
+    "version": "2.0",
+    "sources": ["Lewis Jackson (VWAP + RSI(3) + EMA(8))", "Multi-Indicator Confluence (EMA ribbon, BB, Supertrend, MACD, ATR)"],
+    "description": "A 5-layer hierarchy strategy. Each layer must be satisfied before the next is considered. Fast RSI(7) entry timing from Lewis Jackson blended with the EMA ribbon, Supertrend, MACD, and BB confluence system. Minimum 5/7 scored points required to fire a trade. Designed for 1m–5m crypto scalping.",
+    "primary_timeframes": ["1m (execution)", "5m (confirmation)", "15m (context)"],
+    "best_assets": ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"]
   },
 
-  "indicators": {
-    "ema_8": "Trend direction. Price above EMA(8) = bullish momentum. Below = bearish.",
-    "vwap": "Session bias. Price above VWAP = buyers in control. Below = sellers. Resets at midnight UTC.",
-    "rsi_3": "Entry timing. RSI on 3 candles only — extremely sensitive. Below 30 in an uptrend = snap-back setup. Above 70 in a downtrend = reversal likely."
-  },
-
-  "bias_criteria": {
-    "bullish": ["Price is above VWAP", "Price is above EMA(8)"],
-    "bearish": ["Price is below VWAP", "Price is below EMA(8)"]
-  },
-
-  "entry_rules": {
-    "long": [
-      "Price is above VWAP — buyers in control for the session",
-      "Price is above EMA(8) — uptrend confirmed",
-      "RSI(3) has dropped below 30 — short-term pullback in an uptrend, snap-back likely"
-    ],
-    "short": [
-      "Price is below VWAP — sellers in control",
-      "Price is below EMA(8) — downtrend confirmed",
-      "RSI(3) has spiked above 70 — overbought in a downtrend, reversal likely"
-    ]
-  },
-
-  "exit_rules": [
-    "Exit when RSI(3) crosses back above 50 (for longs) or below 50 (for shorts)",
-    "Hard stop: 0.3% below entry for longs, 0.3% above entry for shorts",
-    "Take profit at next VWAP touch or EMA(8) cross"
+  "watchlist": [
+    "BINANCE:BTCUSDT",
+    "BITSTAMP:BTCUSD",
+    "BITSTAMP:ETHUSD",
+    "BINANCE:SOLUSDT",
+    "BINANCE:XRPUSDT",
+    "BINANCE:BNBUSDT",
+    "BINANCE:DOGEUSDT",
+    "BINANCE:AVAXUSDT",
+    "BINANCE:LINKUSDT",
+    "BINANCE:ADAUSDT",
+    "BINANCE:PEPEUSDT",
+    "BINANCE:SUIUSDT",
+    "BTC.D"
   ],
 
-  "risk_rules": [
-    "Risk maximum 1% of portfolio per trade",
-    "Maximum trade size capped by MAX_TRADE_SIZE_USD in .env",
-    "Maximum trades per day capped by MAX_TRADES_PER_DAY in .env",
-    "Do not trade if price is more than 1.5% away from VWAP — overextended",
-    "Paper trade first — validate this strategy on your specific asset before going live"
+  "layer_1_gates": {
+    "description": "Binary, non-negotiable blockers. ALL must pass or the trade is skipped entirely.",
+    "rules": {
+      "ema_200_gate": "Long trades ONLY above EMA(200). Short trades ONLY below EMA(200). No exceptions.",
+      "vwap_gate": "Long trades ONLY when price is above VWAP. Short trades ONLY when price is below VWAP. VWAP resets at midnight UTC.",
+      "rsi14_regime": "RSI(14) above 50 = bullish regime, only take longs. RSI(14) below 50 = bearish regime, only take shorts. If RSI(14) is within 2 points of 50, skip the trade — no clear regime.",
+      "vwap_distance": "Do NOT trade if price is more than 1.5% away from VWAP. Overextended = mean reversion risk too high."
+    }
+  },
+
+  "layer_2_intermediate_trend": {
+    "description": "Scored: 2 points available. Must score 2/2 for full conviction, 1/2 = reduce position size by 50%.",
+    "rules": {
+      "ema_21_direction": "EMA(21) is rising (current > 3 bars ago) = +1 long. EMA(21) is falling = +1 short.",
+      "supertrend_direction": "Supertrend (ATR 10, mult 3.0) is bullish (price above line, line is green) = +1 long. Bearish = +1 short."
+    }
+  },
+
+  "layer_3_micro_trigger": {
+    "description": "Scored: 2 points available. At least 1/2 required to proceed.",
+    "rules": {
+      "ema_cross": "EMA(8) crosses above EMA(21) = +1 long. EMA(8) crosses below EMA(21) = +1 short. This is the primary entry trigger from Lewis Jackson, preserved in full.",
+      "macd_histogram": "MACD (12,26,9) histogram crosses above zero = +1 long. Crosses below zero = +1 short."
+    }
+  },
+
+  "layer_4_entry_timing": {
+    "description": "Scored: 3 points available. This layer refines the exact candle to enter. At least 1/3 required.",
+    "rules": {
+      "rsi_7_entry": "RSI(7) drops below 30 in an uptrend (snap-back setup) = +1 long. RSI(7) spikes above 70 in a downtrend = +1 short. Core concept from Lewis Jackson, upgraded from RSI(3) to RSI(7) for 40% less noise.",
+      "stochrsi_cross": "StochRSI %K crosses above %D from below 20 = +1 long. %K crosses below %D from above 80 = +1 short.",
+      "bollinger_position": "Price near or touching lower Bollinger Band (20,2) in an uptrend = +1 long (mean reversion setup). Price near upper band in a downtrend = +1 short."
+    }
+  },
+
+  "minimum_confluence": {
+    "required_score": "5 out of 7 scored points (Layers 2+3+4)",
+    "gates_required": "ALL Layer 1 gates must pass before scoring begins",
+    "high_conviction": "7/7 = maximum size (1% risk). 6/7 = standard size (0.75% risk). 5/7 = reduced size (0.5% risk). Below 5/7 = no trade.",
+    "rationale": "Raising bar from 3/5 to 5/7 using a larger indicator set. Eliminates marginal trades while capturing the best setups."
+  },
+
+  "setups": {
+    "ema_cross_scalp": {
+      "name": "EMA 8/21 Cross Scalp (Lewis Jackson Core)",
+      "timeframe": "1m, 5m",
+      "description": "The foundational Lewis Jackson setup, now requiring VWAP + EMA(200) gate before firing.",
+      "long": ["All Layer 1 gates pass", "EMA(8) crosses above EMA(21)", "Price above VWAP", "RSI(7) < 40 (pullback in trend, not overextended)"],
+      "short": ["All Layer 1 gates pass", "EMA(8) crosses below EMA(21)", "Price below VWAP", "RSI(7) > 60"],
+      "stop": "1x ATR(7) below entry candle low",
+      "target": "1.5:1 R:R minimum. Exit at next VWAP touch or RSI(7) crosses 50."
+    },
+    "vwap_bounce": {
+      "name": "VWAP Bounce",
+      "timeframe": "5m, 15m",
+      "description": "Price pulls back to VWAP in an established uptrend — highest probability setup in this system.",
+      "long": ["Supertrend bullish", "Price dips to VWAP from above", "RSI(7) between 25-45 at VWAP touch", "Volume picking up on bounce candle", "EMA(8) still above EMA(21)"],
+      "stop": "Below VWAP — if price closes below, thesis invalid",
+      "target": "Previous session high or 2x ATR(14) above entry"
+    },
+    "bb_squeeze_breakout": {
+      "name": "Bollinger Band Squeeze Breakout",
+      "timeframe": "5m, 15m",
+      "description": "BB compression near VWAP = stored energy. Breakout fires the trade.",
+      "entry": ["BB width at multi-session low (squeeze)", "First candle closes outside the band", "Volume is 1.5x+ the 20-period average", "MACD histogram turning in direction of breakout", "Preferably: squeeze occurs AT or near VWAP level"],
+      "stop": "Back inside the BB (invalidates breakout)",
+      "target": "Opposite BB band, or until Supertrend flips"
+    },
+    "opening_range_breakout": {
+      "name": "Opening Range Breakout (ORB)",
+      "timeframe": "5m",
+      "description": "Mark first 15-minute high/low. Trade the breakout retest.",
+      "entry": ["Mark H/L of first 15 min of session", "Wait for price to break and RETEST the range boundary", "RSI(14) above 50 for longs, below 50 for shorts", "VWAP gate must pass"],
+      "stop": "Back inside opening range",
+      "target": "1x range height projected from breakout point"
+    },
+    "supertrend_flip": {
+      "name": "Supertrend Flip",
+      "timeframe": "5m, 15m",
+      "description": "Supertrend color change in direction of VWAP + EMA(21) trend.",
+      "long": ["Supertrend flips green", "Price already above VWAP", "EMA(8) above EMA(21)", "RSI(14) > 50"],
+      "short": ["Supertrend flips red", "Price already below VWAP", "EMA(8) below EMA(21)", "RSI(14) < 50"],
+      "stop": "1.5x ATR(14) from entry",
+      "target": "Hold until next Supertrend flip or 2:1 R:R"
+    },
+    "rsi7_snapback": {
+      "name": "RSI(7) Snap-Back (Lewis Jackson Core, upgraded)",
+      "timeframe": "1m, 5m",
+      "description": "RSI(7) oversold in an established uptrend. Replaces RSI(3) with less noise.",
+      "long": ["All Layer 1 gates pass", "RSI(7) drops below 30", "Price still above EMA(21) and VWAP", "StochRSI %K starting to curl upward from below 20"],
+      "short": ["All Layer 1 gates pass", "RSI(7) spikes above 70", "Price still below EMA(21) and VWAP", "StochRSI %K starting to curl downward from above 80"],
+      "stop": "1x ATR(7) from entry",
+      "target": "RSI(7) crosses back through 50, or VWAP touch"
+    }
+  },
+
+  "exit_rules": {
+    "priority_order": "Apply in this order — first trigger hit closes the trade",
+    "1_hard_stop": "1x ATR(7) below entry for scalps. 1.5x ATR(14) for swing-day trades. Dynamic — does NOT use fixed % stop.",
+    "2_supertrend_flip": "If Supertrend flips against your position, exit immediately. Structural trend break.",
+    "3_rsi7_momentum": "RSI(7) crosses back above 50 for longs (or below 50 for shorts) = momentum exit.",
+    "4_macd_cross": "MACD histogram crosses back below zero for longs (above for shorts) = momentum confirmation of reversal.",
+    "5_vwap_target": "For snap-back trades: take profit at VWAP touch. Do not hold through VWAP without a reason.",
+    "6_ema8_cross": "EMA(8) crosses back below EMA(21) for longs — original Lewis Jackson exit trigger, still valid."
+  },
+
+  "risk_management": {
+    "risk_per_trade": {
+      "7_of_7": "1.0% of account (maximum — reserved for perfect confluence)",
+      "6_of_7": "0.75% of account",
+      "5_of_7": "0.5% of account (minimum — do not go below this or the trade isn't worth taking)"
+    },
+    "stop_sizing": "ATR-based only. Stop = 1x ATR(7) for scalps (1m-5m), 1.5x ATR(14) for day trades (15m+). Never use a fixed % stop — it doesn't adapt to volatility.",
+    "minimum_rr": "1.5:1 for RSI(7) snap-back scalps. 2:1 for EMA cross and Supertrend trades. 2.5:1 for BB squeeze breakouts.",
+    "simultaneous_positions": "Maximum 2% of account in open scalp positions at any one time.",
+    "daily_loss_limit": "Hard stop at -3% account drawdown for the day. Close all positions. Walk away.",
+    "high_volatility_rule": "If ATR(14) is in the top 20% of its 30-day range, cut all position sizes by 50%.",
+    "low_volatility_rule": "BB squeeze detected + ATR contracting = allowed to size up to 1.25x normal (highest edge setup).",
+    "overextension_rule": "Do not enter if price is more than 1.5% from VWAP. Wait for reversion before trading.",
+    "max_trades_per_session": "6-8 high-conviction trades maximum. Quality over quantity."
+  },
+
+  "macro_filters": {
+    "btc_dominance": "Check BTC.D first. Rising BTC.D = stay in BTC, avoid altcoin longs. Falling BTC.D = altcoin pumps incoming.",
+    "market_regime": "If BTC is below its EMA(200) on the 1H chart, reduce all position sizes by 50% across the board — macro bear regime.",
+    "vix_proxy": "Extreme crypto-wide volatility (all coins moving >5% in 1 hour) = sit out or cut to 0.25% risk per trade only."
+  },
+
+  "pre_trade_checklist": [
+    "1. BTC.D check — rising or falling?",
+    "2. Is BTC above or below its 1H EMA(200)?",
+    "3. Is price above or below VWAP? (Layer 1 gate)",
+    "4. Is price above or below EMA(200)? (Layer 1 gate)",
+    "5. Is RSI(14) above or below 50? (Layer 1 gate)",
+    "6. Is price within 1.5% of VWAP? (Layer 1 gate)",
+    "7. What is my Layer 2 score? (0, 1, or 2)",
+    "8. What is my Layer 3 score? (0, 1, or 2)",
+    "9. What is my Layer 4 score? (0, 1, 2, or 3)",
+    "10. Total scored points >= 5? If yes: what size? If no: skip.",
+    "11. Where is my stop (ATR-based)? Is the R:R acceptable?",
+    "12. Have I set the stop order BEFORE entering?"
   ],
 
-  "notes": "Scalping strategy — designed for 1m to 5m timeframes. RSI(3) is intentionally fast and sensitive. Do not apply to higher timeframes."
+  "notes": "This strategy blends Lewis Jackson's fast RSI(7) snap-back timing and EMA(8) cross trigger with a structured 5-layer confluence hierarchy. The key improvements over both source strategies: RSI(7) replaces RSI(3) for 40% less noise; ATR-based stops replace fixed % stops; a 5/7 minimum confluence score replaces both 3/5 and the unscored Lewis Jackson rules; Supertrend confirmation is added to every setup to eliminate false EMA cross whipsaws. All entries still require the VWAP session bias gate as non-negotiable — this is the most important single rule in the system."
 }
