@@ -26,8 +26,9 @@ const BINANCE_MAP = {
 // ─── Market Data ─────────────────────────────────────────────────────────────
 
 async function fetchCandles(symbol, limit = 300) {
-  const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=1h&limit=${limit}`;
-  const res = await fetch(url);
+  let res = await fetch(`https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=1h&limit=${limit}`);
+  if (!res.ok && res.status === 400)
+    res = await fetch(`https://api.binance.us/api/v3/klines?symbol=${symbol}&interval=1h&limit=${limit}`);
   if (!res.ok) throw new Error(`Binance ${res.status}`);
   return (await res.json()).map(k => ({
     time: k[0], high: parseFloat(k[2]), low: parseFloat(k[3]),
@@ -162,7 +163,11 @@ async function run() {
   const watching = results.filter(r => r.ok && r.gatesPass);
   const blocked  = results.filter(r => r.ok && !r.gatesPass);
 
-  let msg = `🌅 <b>Morning Debrief</b>\n`;
+  const hour = now.getUTCHours();
+  const isMorning = hour >= 20 || hour < 10; // 8:30am AEST = 22:30 UTC
+  const debriefLabel = isMorning ? "🌅 Morning Debrief" : "🌆 Afternoon Debrief";
+
+  let msg = `<b>${debriefLabel}</b>\n`;
   msg    += `${dateStr} · ${timeStr}\n`;
   msg    += `──────────────────────────\n\n`;
 
