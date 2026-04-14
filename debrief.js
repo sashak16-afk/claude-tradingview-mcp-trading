@@ -1,14 +1,15 @@
 /**
- * Morning Debrief — sends a daily market summary to Telegram
- * Runs via Railway cron at 8:30am (configured per timezone in railway service)
+ * Debrief — sends a market summary + portfolio snapshot to Telegram
+ * Runs via Railway cron at 8:30am and 5:30pm AEST (set per-service in dashboard)
  *
- * What it covers:
- *   - Market snapshot for all watched symbols (price, RSI14, trend)
- *   - Layer 1 gate status for each coin (tells you if bot CAN trade today)
- *   - Bot config reminder
+ * Covers:
+ *   - Open positions: quantity, AUD value, P&L vs entry
+ *   - Market snapshot: price, RSI14, Supertrend per symbol
+ *   - Layer 1 gate status (tells you if bot CAN trade this session)
  */
 
 import "dotenv/config";
+import crypto from "crypto";
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHAT_ID   = process.env.TELEGRAM_CHAT_ID;
@@ -20,10 +21,23 @@ const BINANCE_MAP = {
   XBTAUD:  "BTCUSDT",  ETHAUD:  "ETHUSDT",  SOLAUD:  "SOLUSDT",
   XRPAUD:  "XRPUSDT",  XDGAUD:  "DOGEUSDT", LINKAUD: "LINKUSDT",
   SEIUSD:  "SEIUSDT",  NEARUSD: "NEARUSDT",
-  XBTUSDT: "BTCUSDT",  XDGUSDT: "DOGEUSDT",
 };
 
-// ─── Market Data ─────────────────────────────────────────────────────────────
+// Kraken asset codes for balance lookup
+const KRAKEN_BASE = {
+  XBTAUD: "XXBT", ETHAUD: "XETH",  SOLAUD:  "SOL",
+  XRPAUD: "XXRP", XDGAUD: "XXDG", LINKAUD: "LINK",
+  SEIUSD: "SEI",  NEARUSD: "NEAR",
+};
+
+// Short string to match pairs in TradesHistory
+const KRAKEN_PAIR_PATTERN = {
+  XBTAUD: "XBT", ETHAUD: "ETH",  SOLAUD:  "SOL",
+  XRPAUD: "XRP", XDGAUD: "XDG", LINKAUD: "LINK",
+  SEIUSD: "SEI", NEARUSD: "NEAR",
+};
+
+// ─── Market Data (Binance) ────────────────────────────────────────────────────
 
 async function fetchCandles(symbol, limit = 300) {
   let res = await fetch(`https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=1h&limit=${limit}`);
@@ -34,6 +48,82 @@ async function fetchCandles(symbol, limit = 300) {
     time: k[0], high: parseFloat(k[2]), low: parseFloat(k[3]),
     close: parseFloat(k[4]), volume: parseFloat(k[5]),
   }));
+}
+
+// ─── Kraken Private API ───────────────────────────────────────────────────────
+
+function signKraken(path, nonce, postData) {
+  const secret = Buffer.from(process.env.KRAKEN_API_SECRET, "base64");
+  const hash   = crypto.createHash("sha256").update(nonce + postData).digest("binary");
+  return crypto.createHmac("sha512", secret).update(path + hash, "binary").digest("base64");
+}
+
+async function krakenPrivate(path, params = {}) {
+  const nonce    = Date.now().toString();
+  const postData = new URLSearchParams({ nonce, ...params }).toString();
+  const res = await fetch(`https://api.kraken.com${path}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      "API-Key":  process.env.KRAKEN_API_KEY,
+      "API-Sign": signKraken(path, nonce, postData),
+    },
+    body: postData,
+  });
+  const data = await res.json();
+  if (data.error && data.error.length > 0) throw new Error(data.error.join(", "));
+  return data.result;
+}
+
+async function fetchKrakenPrice(symbol) {
+  const res  = await fetch(`https://api.kraken.com/0/public/Ticker?pair=${symbol}`);
+  const data = await res.json();
+  if (data.error && data.error.length > 0) throw new Error(data.error.join(", "));
+  return parseFloat(Object.values(data.result)[0].c[0]);
+}
+
+// ─── Portfolio (live Kraken balance + trade history) ─────────────────────────
+
+async function fetchPortfolio() {
+  if (!process.env.KRAKEN_API_KEY || !process.env.KRAKEN_API_SECRET) return [];
+
+  try {
+    const balances = await krakenPrivate("/0/private/Balance");
+    const history  = await krakenPrivate("/0/private/TradesHistory");
+    const trades = Object.values(history.trades || {});
+
+    const positions = [];
+    for (const symbol of SYMBOLS) {
+      const base    = KRAKEN_BASE[symbol];
+      const pattern = KRAKEN_PAIR_PATTERN[symbol];
+      if (!base || !pattern) continue;
+
+      const balance = parseFloat(balances[base] || "0");
+      if (balance <= 0) continue;
+
+      let currentPrice;
+      try { currentPrice = await fetchKrakenPrice(symbol); }
+      catch { continue; }
+
+      const valueAUD = balance * currentPrice;
+      if (valueAUD < 1.0) continue; // skip dust
+
+      const lastBuy = trades
+        .filter(t => t.type === "buy" && t.pair.toUpperCase().includes(pattern))
+        .sort((a, b) => b.time - a.time)[0];
+
+      const entryPrice = lastBuy ? parseFloat(lastBuy.price) : currentPrice;
+      const costBasis  = entryPrice * balance;
+      const pnl        = valueAUD - costBasis;
+      const pnlPct     = costBasis > 0 ? (pnl / costBasis) * 100 : 0;
+
+      positions.push({ symbol, balance, currentPrice, valueAUD, entryPrice, pnl, pnlPct });
+    }
+    return positions;
+  } catch (err) {
+    console.warn("Portfolio fetch failed:", err.message);
+    return [];
+  }
 }
 
 // ─── Indicators ───────────────────────────────────────────────────────────────
@@ -64,7 +154,7 @@ function calcVWAP(candles) {
   const session = candles.filter(c => c.time >= midnight.getTime());
   if (!session.length) return null;
   const tpv = session.reduce((s, c) => s + ((c.high + c.low + c.close) / 3) * c.volume, 0);
-  const vol = session.reduce((s, c) => s + c.volume, 0);
+  const vol  = session.reduce((s, c) => s + c.volume, 0);
   return vol === 0 ? null : tpv / vol;
 }
 
@@ -81,7 +171,6 @@ function calcSupertrend(candles, period = 10, multiplier = 3.0) {
   let atr = trs.slice(0, period).reduce((a, b) => a + b, 0) / period;
   const atrS = [atr];
   for (let i = period; i < trs.length; i++) { atr = (atr * (period - 1) + trs[i]) / period; atrS.push(atr); }
-
   let trend = 1, fU = 0, fL = 0;
   for (let i = 0; i < atrS.length; i++) {
     const ci  = i + period;
@@ -98,7 +187,7 @@ function calcSupertrend(candles, period = 10, multiplier = 3.0) {
   return { bullish: trend === 1 };
 }
 
-// ─── Per-symbol Analysis ──────────────────────────────────────────────────────
+// ─── Per-symbol Market Analysis ───────────────────────────────────────────────
 
 async function analyseSymbol(symbol) {
   try {
@@ -124,11 +213,10 @@ async function analyseSymbol(symbol) {
 
 // ─── Formatting ───────────────────────────────────────────────────────────────
 
-function fmtPrice(n) {
+function fmtAUD(n) {
   if (n === null || n === undefined) return "N/A";
-  if (n >= 10000) return "$" + n.toLocaleString("en-US", { maximumFractionDigits: 0 });
-  if (n >= 1000)  return "$" + n.toLocaleString("en-US", { maximumFractionDigits: 0 });
-  if (n >= 1)     return "$" + n.toFixed(3);
+  if (Math.abs(n) >= 1000) return "$" + n.toLocaleString("en-AU", { maximumFractionDigits: 0 });
+  if (Math.abs(n) >= 1)    return "$" + n.toFixed(2);
   return "$" + n.toFixed(5);
 }
 
@@ -152,68 +240,92 @@ async function run() {
     process.exit(1);
   }
 
-  console.log("Generating morning debrief...");
-  const results = await Promise.all(SYMBOLS.map(analyseSymbol));
+  console.log("Generating debrief...");
+
+  const [results, positions] = await Promise.all([
+    Promise.all(SYMBOLS.map(analyseSymbol)),
+    fetchPortfolio(),
+  ]);
 
   const now     = new Date();
   const tz      = process.env.TZ || "Australia/Sydney";
   const dateStr = now.toLocaleDateString("en-AU", { weekday: "long", day: "numeric", month: "long", year: "numeric", timeZone: tz });
   const timeStr = now.toLocaleTimeString("en-AU", { hour: "2-digit", minute: "2-digit", timeZone: tz, timeZoneName: "short" });
 
-  const watching = results.filter(r => r.ok && r.gatesPass);
-  const blocked  = results.filter(r => r.ok && !r.gatesPass);
+  const hour        = now.getUTCHours();
+  const isMorning   = hour >= 20 || hour < 10; // 22:30 UTC = 8:30am AEST
+  const label       = isMorning ? "🌅 Morning Debrief" : "🌆 Afternoon Debrief";
+  const watching    = results.filter(r => r.ok && r.gatesPass);
+  const blocked     = results.filter(r => r.ok && !r.gatesPass);
 
-  const hour = now.getUTCHours();
-  const isMorning = hour >= 20 || hour < 10; // 8:30am AEST = 22:30 UTC
-  const debriefLabel = isMorning ? "🌅 Morning Debrief" : "🌆 Afternoon Debrief";
-
-  let msg = `<b>${debriefLabel}</b>\n`;
+  let msg = `<b>${label}</b>\n`;
   msg    += `${dateStr} · ${timeStr}\n`;
-  msg    += `──────────────────────────\n\n`;
 
-  // Market snapshot table
-  msg += `<b>📊 Market Snapshot  (1H)</b>\n\n`;
-  for (const r of results) {
-    if (!r.ok) {
-      msg += `• <b>${r.symbol}</b>  ⚠️ data unavailable\n`;
-      continue;
+  // ── Portfolio ──────────────────────────────────────────────────────────────
+  msg += `\n──────────────────────────\n`;
+  msg += `<b>📂 Open Positions</b>\n\n`;
+
+  if (positions.length === 0) {
+    msg += `<i>No open positions</i>\n`;
+  } else {
+    const totalValue = positions.reduce((s, p) => s + p.valueAUD, 0);
+    const totalPnl   = positions.reduce((s, p) => s + p.pnl, 0);
+
+    for (const p of positions) {
+      const sign    = p.pnl >= 0 ? "+" : "";
+      const emoji   = p.pnl >= 0 ? "🟢" : "🔴";
+      const qty     = p.balance < 1 ? p.balance.toFixed(6) : p.balance.toFixed(2);
+      msg += `${emoji} <b>${p.symbol}</b>\n`;
+      msg += `   ${qty} units · now ${fmtAUD(p.currentPrice)}\n`;
+      msg += `   Value: <b>${fmtAUD(p.valueAUD)} AUD</b>`;
+      msg += `  ·  Entry: ${fmtAUD(p.entryPrice)}\n`;
+      msg += `   P&amp;L: <b>${sign}${fmtAUD(p.pnl)} AUD</b>  (${sign}${p.pnlPct.toFixed(1)}%)\n\n`;
     }
-    const trend   = r.st ? (r.st.bullish ? "▲" : "▼") : "─";
-    const rsiStr  = r.rsi14 ? r.rsi14.toFixed(0) : "N/A";
-    const gate    = r.gatesPass ? "👀" : "🚫";
-    msg += `${gate} <b>${r.symbol}</b>  ${fmtPrice(r.price)}  RSI ${rsiStr} ${trend}\n`;
+
+    const totalSign  = totalPnl >= 0 ? "+" : "";
+    const totalEmoji = totalPnl >= 0 ? "📈" : "📉";
+    msg += `${totalEmoji} <b>Total: ${fmtAUD(totalValue)} AUD  ·  P&amp;L: ${totalSign}${fmtAUD(totalPnl)} AUD</b>\n`;
   }
 
-  // Layer 1 detail
+  // ── Market Snapshot ────────────────────────────────────────────────────────
+  msg += `\n──────────────────────────\n`;
+  msg += `<b>📊 Market Snapshot  (1H)</b>\n\n`;
+  for (const r of results) {
+    if (!r.ok) { msg += `• <b>${r.symbol}</b>  ⚠️ data unavailable\n`; continue; }
+    const trend  = r.st ? (r.st.bullish ? "▲" : "▼") : "─";
+    const rsiStr = r.rsi14 ? r.rsi14.toFixed(0) : "N/A";
+    const gate   = r.gatesPass ? "👀" : "🚫";
+    msg += `${gate} <b>${r.symbol}</b>  ${fmtAUD(r.price)}  RSI ${rsiStr} ${trend}\n`;
+  }
+
+  // ── Gate Detail ────────────────────────────────────────────────────────────
   msg += `\n──────────────────────────\n`;
   if (watching.length > 0) {
-    msg += `\n<b>✅ Coins Passing All Layer 1 Gates</b>\n`;
-    msg += `<i>Bot will evaluate these for entry this session</i>\n\n`;
+    msg += `<b>✅ Passing All Layer 1 Gates</b>\n`;
+    msg += `<i>Bot will evaluate these for entry</i>\n\n`;
     for (const r of watching) {
-      const rsiStr = r.rsi14 ? r.rsi14.toFixed(0) : "N/A";
-      msg += `<b>${r.symbol}</b>  ${fmtPrice(r.price)}  RSI14: ${rsiStr}\n`;
+      msg += `<b>${r.symbol}</b>  ${fmtAUD(r.price)}  RSI14: ${r.rsi14 ? r.rsi14.toFixed(0) : "N/A"}\n`;
       msg += `  EMA200 ✅  VWAP ✅  Regime ✅  Distance ✅\n\n`;
     }
   } else {
-    msg += `\n<b>Layer 1 Gates — Nothing passing right now</b>\n`;
+    msg += `<b>Layer 1 Gates — Nothing passing</b>\n`;
     msg += `<i>Bot will block all entries this session</i>\n\n`;
   }
 
-  // Failed gates detail for top coins
   const topBlocked = blocked.filter(r => ["XBTAUD","ETHAUD","SOLAUD"].includes(r.symbol));
   if (topBlocked.length > 0) {
     msg += `<b>🔎 Why top coins are blocked:</b>\n`;
     for (const r of topBlocked) {
       const fails = [];
-      if (!r.g1) fails.push(`below EMA200`);
-      if (!r.g2) fails.push(`below VWAP`);
+      if (!r.g1) fails.push("below EMA200");
+      if (!r.g2) fails.push("below VWAP");
       if (!r.g3) fails.push(`RSI14 ${r.rsi14 ? r.rsi14.toFixed(0) : "N/A"} (need >52)`);
-      if (!r.g4) fails.push(`>1.5% from VWAP`);
+      if (!r.g4) fails.push(">1.5% from VWAP");
       msg += `• <b>${r.symbol}</b>: ${fails.join(", ")}\n`;
     }
   }
 
-  // Footer
+  // ── Footer ─────────────────────────────────────────────────────────────────
   msg += `\n──────────────────────────\n`;
   msg += `⚙️ <b>Bot</b>  🔴 LIVE · 1H · ${SYMBOLS.length} symbols · Kraken\n`;
   msg += `📋 Min confluence: 5/7 · Runs every hour`;
