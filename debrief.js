@@ -234,7 +234,7 @@ async function sendTelegram(text) {
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
-async function run() {
+export async function runDebrief() {
   if (!BOT_TOKEN || !CHAT_ID) {
     console.error("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID");
     process.exit(1);
@@ -334,7 +334,10 @@ async function run() {
   console.log("Debrief sent ✅");
 }
 
-run().catch(err => {
-  console.error("Debrief error:", err);
-  process.exit(1);
-});
+// Run directly (e.g. node debrief.js) or triggered from bot.js at debrief hours
+if (process.argv[1] && process.argv[1].includes("debrief")) {
+  runDebrief().catch(err => {
+    console.error("Debrief error:", err);
+    process.exit(1);
+  });
+}

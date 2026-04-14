@@ -839,6 +839,18 @@ async function run() {
   saveLog(log);
   console.log(`\nDecision log saved → ${LOG_FILE}`);
   console.log("═══════════════════════════════════════════════════════════\n");
+
+  // ── Debrief: fire at 7:00 UTC (5pm AEST) and 22:00 UTC (8am AEST) ──────
+  const utcHour = new Date().getUTCHours();
+  if (utcHour === 7 || utcHour === 22) {
+    console.log("⏰ Debrief hour — running debrief...");
+    try {
+      const { runDebrief } = await import("./debrief.js");
+      await runDebrief();
+    } catch (err) {
+      console.error("Debrief error:", err.message);
+    }
+  }
 }
 
 if (process.argv.includes("--tax-summary")) {
