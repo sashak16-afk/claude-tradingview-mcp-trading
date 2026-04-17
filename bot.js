@@ -115,9 +115,9 @@ const BINANCE_SYMBOL_MAP = {
   XDGAUD:  "DOGEUSDT",
   LINKAUD: "LINKUSDT",
   ADAAUD:  "ADAUSDT",
-  DOTAUD:  "DOTUSDT",
-  UNIAUD:  "UNIUSDT",
-  ATOMAUD: "ATOMUSDT",
+  DOTUSD:  "DOTUSDT",
+  UNIUSD:  "UNIUSDT",
+  ATOMUSD: "ATOMUSDT",
   XBTUSDT: "BTCUSDT",
   XDGUSDT: "DOGEUSDT",
 };
@@ -135,9 +135,9 @@ const KRAKEN_BASE = {
   XDGAUD:  "XXDG",
   LINKAUD: "LINK",
   ADAAUD:  "ADA",
-  DOTAUD:  "DOT",
-  UNIAUD:  "UNI",
-  ATOMAUD: "ATOM",
+  DOTUSD:  "DOT",
+  UNIUSD:  "UNI",
+  ATOMUSD: "ATOM",
 };
 
 // Short base-currency string used to match pairs in TradesHistory
@@ -149,9 +149,9 @@ const KRAKEN_PAIR_PATTERN = {
   XDGAUD:  "XDG",
   LINKAUD: "LINK",
   ADAAUD:  "ADA",
-  DOTAUD:  "DOT",
-  UNIAUD:  "UNI",
-  ATOMAUD: "ATOM",
+  DOTUSD:  "DOT",
+  UNIUSD:  "UNI",
+  ATOMUSD: "ATOM",
 };
 
 // Minimum order volumes enforced by Kraken (in base currency units)
