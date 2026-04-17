@@ -31,12 +31,13 @@ function checkOnboarding() {
         "KRAKEN_API_SECRET=",
         "",
         "# Trading config",
-        "PORTFOLIO_VALUE_USD=500",
-        "MAX_TRADE_SIZE_AUD=50",
+        "PORTFOLIO_VALUE_USD=1000",
+        "MAX_TRADE_SIZE_AUD=100",
+        "MIN_TRADE_SIZE_AUD=100",
         "MAX_TRADES_PER_DAY=10",
         "PAPER_TRADING=true",
         "SYMBOLS=XBTAUD,ETHAUD,SOLAUD,XRPAUD,XDGAUD,LINKAUD",
-        "TIMEFRAME=1H",
+        "TIMEFRAME=30m",
       ].join("\n") + "\n",
     );
     try { execSync("open .env"); } catch {}
@@ -56,9 +57,10 @@ const CONFIG = {
   symbols: process.env.SYMBOLS
     ? process.env.SYMBOLS.split(",").map((s) => s.trim()).filter(Boolean)
     : [process.env.SYMBOL || "XBTAUD"],
-  timeframe: process.env.TIMEFRAME || "1H",
-  portfolioValue: parseFloat(process.env.PORTFOLIO_VALUE_USD || "500"),
-  maxTradeSizeAUD: parseFloat(process.env.MAX_TRADE_SIZE_AUD || "50"),
+  timeframe: process.env.TIMEFRAME || "30m",
+  portfolioValue: parseFloat(process.env.PORTFOLIO_VALUE_USD || "1000"),
+  maxTradeSizeAUD: parseFloat(process.env.MAX_TRADE_SIZE_AUD || "100"),
+  minTradeSizeAUD: parseFloat(process.env.MIN_TRADE_SIZE_AUD || "100"),
   maxTradesPerDay: parseInt(process.env.MAX_TRADES_PER_DAY || "10"),
   paperTrading: process.env.PAPER_TRADING !== "false",
   kraken: {
@@ -147,17 +149,23 @@ const KRAKEN_PAIR_PATTERN = {
 };
 
 // Minimum order volumes enforced by Kraken (in base currency units)
+// At MIN_TRADE_SIZE_AUD=$50, LINK (~$12 AUD/unit) yields ~4 units — well above the 1-unit minimum.
 const KRAKEN_MIN_ORDER = {
-  LINKAUD: 1,    // min 1 LINK (~$12 AUD) — our trade sizes (~$2.50–$5) are too small
+  LINKAUD: 1,    // min 1 LINK (~$12 AUD)
 };
 
 // ─── Kraken live price (AUD) ──────────────────────────────────────────────────
 
-async function fetchKrakenPrice(symbol) {
+async function fetchKrakenTicker(symbol) {
   const res = await fetch(`https://api.kraken.com/0/public/Ticker?pair=${symbol}`);
   const data = await res.json();
   if (data.error && data.error.length > 0) throw new Error(`Kraken ticker: ${data.error.join(", ")}`);
-  return parseFloat(Object.values(data.result)[0].c[0]);
+  const t = Object.values(data.result)[0];
+  return {
+    last: parseFloat(t.c[0]),
+    ask:  parseFloat(t.a[0]),
+    bid:  parseFloat(t.b[0]),
+  };
 }
 
 // ─── Market Data (Binance public API — no auth needed) ────────────────────────
@@ -348,11 +356,18 @@ function calcBollingerBands(closes, period = 20, stdDev = 2) {
   return { upper: middle + stdDev * std, middle, lower: middle - stdDev * std };
 }
 
+// Volume SMA — average volume of the last `period` closed bars (excludes current bar)
+function calcVolumeSMA(candles, period = 20) {
+  if (candles.length < period + 1) return null;
+  const closed = candles.slice(-period - 1, -1);
+  return closed.reduce((s, c) => s + c.volume, 0) / period;
+}
+
 // ─── 5-Layer Confluence Check ─────────────────────────────────────────────────
 // Returns { allPass, score, conditions, direction }
 
 function runConfluenceCheck(price, indicators) {
-  const { ema8, ema21, ema21_3ago, ema200, vwap, rsi14, rsi7, macd, supertrend, stochRsi, bb } = indicators;
+  const { ema8, ema21, ema21_3ago, ema200, vwap, rsi14, rsi7, macd, supertrend, stochRsi, bb, curVolume, avgVolume } = indicators;
 
   const conditions = [];
   const chk = (label, pass, detail) => {
@@ -367,12 +382,12 @@ function runConfluenceCheck(price, indicators) {
   chk("Price above EMA(200) — macro regime", g1,
     `price ${price.toFixed(2)} vs EMA200 ${ema200 ? ema200.toFixed(2) : "N/A"}`);
 
-  const g2 = vwap !== null && price > vwap;
-  chk("Price above VWAP — session bias", g2,
+  const g2 = vwap !== null && price >= vwap * 0.998;
+  chk("Price at or within 0.2% below VWAP — session bias", g2,
     `price ${price.toFixed(2)} vs VWAP ${vwap ? vwap.toFixed(2) : "N/A"}`);
 
-  const g3 = rsi14 !== null && rsi14 > 52;
-  chk("RSI(14) above 52 — bullish regime", g3,
+  const g3 = rsi14 !== null && rsi14 > 50;
+  chk("RSI(14) above 50 — bullish regime", g3,
     `RSI14 = ${rsi14 ? rsi14.toFixed(1) : "N/A"}`);
 
   const dist = vwap ? Math.abs((price - vwap) / vwap) * 100 : 999;
@@ -397,8 +412,8 @@ function runConfluenceCheck(price, indicators) {
   chk("Supertrend bullish [+1]", l2b, supertrend ? (supertrend.bullish ? "Green" : "Red") : "N/A");
   if (l2b) score++;
 
-  // ── Layer 3: Micro trigger — 2 pts ───────────────────────────────────
-  console.log("\n── Layer 3: Micro Trigger (2 pts) ──────────────────────\n");
+  // ── Layer 3: Micro trigger — 3 pts ───────────────────────────────────
+  console.log("\n── Layer 3: Micro Trigger (3 pts) ──────────────────────\n");
 
   const l3a = ema8 !== null && ema21 !== null && ema8 > ema21;
   chk("EMA(8) above EMA(21) [+1]", l3a,
@@ -410,52 +425,63 @@ function runConfluenceCheck(price, indicators) {
     macd ? `hist ${macd.histogram.toFixed(6)}` : "N/A");
   if (l3b) score++;
 
+  const l3c = curVolume !== null && avgVolume !== null && curVolume > avgVolume * 0.5;
+  chk("Volume above 50% of 20-bar average [+1]", l3c,
+    (curVolume && avgVolume) ? `cur ${curVolume.toFixed(0)} vs avg ${avgVolume.toFixed(0)}` : "N/A");
+  if (l3c) score++;
+
   // ── Layer 4: Entry timing — 3 pts ────────────────────────────────────
   console.log("\n── Layer 4: Entry Timing (3 pts) ───────────────────────\n");
 
-  const l4a = rsi7 !== null && rsi7 < 30;
-  chk("RSI(7) below 30 — snap-back in uptrend [+1]", l4a,
+  const l4a = rsi7 !== null && rsi7 < 35;
+  chk("RSI(7) below 35 — snap-back in uptrend [+1]", l4a,
     rsi7 ? `RSI7 = ${rsi7.toFixed(1)}` : "N/A");
   if (l4a) score++;
 
   const l4b = stochRsi !== null
     && stochRsi.k > stochRsi.d
     && stochRsi.prevK <= stochRsi.prevD
-    && stochRsi.prevK < 40;
+    && stochRsi.prevK < 50;
   chk("StochRSI %K crossing above %D from oversold [+1]", l4b,
     stochRsi ? `K=${stochRsi.k.toFixed(1)} D=${stochRsi.d.toFixed(1)} prevK=${stochRsi.prevK.toFixed(1)}` : "N/A");
   if (l4b) score++;
 
-  const l4c = bb !== null && price <= bb.lower * 1.005;
+  const l4c = bb !== null && price <= bb.lower * 1.02;
   chk("Price at/near lower Bollinger Band [+1]", l4c,
     bb ? `price ${price.toFixed(4)} vs BB lower ${bb.lower.toFixed(4)}` : "N/A");
   if (l4c) score++;
 
   const allPass = score >= 5;
-  console.log(`\n── Confluence Score: ${score}/7 — ${allPass ? "✅ TRADE SIGNAL" : "🚫 need 5 minimum"}\n`);
+  console.log(`\n── Confluence Score: ${score}/8 — ${allPass ? "✅ TRADE SIGNAL" : "🚫 need 5 minimum"}\n`);
   return { allPass, score, conditions, direction: "LONG" };
 }
 
 // ─── Trade Size (score-based risk %) ─────────────────────────────────────────
 
 function calcTradeSize(score) {
+  // Score is now /8 — top tier is 7+ (was 7/7)
   const riskPct = score >= 7 ? 0.010 : score >= 6 ? 0.0075 : 0.005;
-  return Math.min(CONFIG.portfolioValue * riskPct, CONFIG.maxTradeSizeAUD);
+  const sized = CONFIG.portfolioValue * riskPct;
+  return Math.max(Math.min(sized, CONFIG.maxTradeSizeAUD), CONFIG.minTradeSizeAUD);
 }
 
 // ─── Exit Conditions ──────────────────────────────────────────────────────────
 
-function checkExitConditions(position, price, ema8, vwap) {
+function checkExitConditions(position, price, atr, highWaterMark) {
   const reasons = [];
-  console.log("\n── Exit Check ───────────────────────────────────────────\n");
-  console.log(`  Entry:       $${position.entryPrice.toFixed(4)}`);
-  console.log(`  Current:     $${price.toFixed(4)}`);
-  console.log(`  Stop-loss:   $${position.stopLoss.toFixed(4)}`);
-  console.log(`  Take-profit: $${position.takeProfit.toFixed(4)}`);
+  const trailingStop = highWaterMark - atr * 2.0;
 
-  if (price <= position.stopLoss)   reasons.push(`Stop-loss hit (${price.toFixed(4)} ≤ ${position.stopLoss.toFixed(4)})`);
+  console.log("\n── Exit Check ───────────────────────────────────────────\n");
+  console.log(`  Entry:          $${position.entryPrice.toFixed(4)}`);
+  console.log(`  Current:        $${price.toFixed(4)}`);
+  console.log(`  High-water:     $${highWaterMark.toFixed(4)}`);
+  console.log(`  Trailing stop:  $${trailingStop.toFixed(4)} (HWM − 2.0×ATR)`);
+  console.log(`  Hard stop-loss: $${position.stopLoss.toFixed(4)}`);
+  console.log(`  Take-profit:    $${position.takeProfit.toFixed(4)}`);
+
+  if (price <= position.stopLoss)   reasons.push(`Hard stop hit (${price.toFixed(4)} ≤ ${position.stopLoss.toFixed(4)})`);
   if (price >= position.takeProfit) reasons.push(`Take-profit hit (${price.toFixed(4)} ≥ ${position.takeProfit.toFixed(4)})`);
-  if (vwap && ema8 && price < vwap && price < ema8) reasons.push("Trend exit — price below VWAP and EMA8");
+  if (price <= trailingStop)        reasons.push(`Trailing stop hit (${price.toFixed(4)} ≤ ${trailingStop.toFixed(4)}, HWM ${highWaterMark.toFixed(4)})`);
 
   if (reasons.length === 0) console.log("  📊 Holding — no exit condition triggered");
   else reasons.forEach((r) => console.log(`  🚨 ${r}`));
@@ -502,6 +528,21 @@ async function krakenPrivate(path, params = {}) {
   return data.result;
 }
 
+// ─── Open Order Check ─────────────────────────────────────────────────────────
+// Prevents duplicate limit buy orders across stateless Railway runs.
+
+async function fetchKrakenOpenOrders(symbol) {
+  try {
+    const result = await krakenPrivate("/0/private/OpenOrders");
+    const open   = Object.values(result.open || {});
+    const pattern = KRAKEN_PAIR_PATTERN[symbol];
+    return open.filter((o) => o.descr && o.descr.pair && o.descr.pair.toUpperCase().includes(pattern));
+  } catch (err) {
+    console.log(`  ⚠️  Open order check failed: ${err.message}`);
+    return [];
+  }
+}
+
 // ─── Live Position Lookup (Kraken balance + trade history) ────────────────────
 // Replaces the file-based getPosition() — works across ephemeral Railway runs.
 
@@ -529,7 +570,7 @@ async function getPositionFromKraken(symbol, audPrice, usdtPrice, atr) {
     // Convert AUD entry to USDT using current ratio (for stop/take comparison)
     const entryPrice  = entryPriceAUD * (usdtPrice / audPrice);
     const stopLoss    = entryPrice - atr * 1.5;
-    const takeProfit  = entryPrice + atr * 2.5;
+    const takeProfit  = entryPrice * 1.10;
 
     console.log(`  📂 Open position found: ${balance.toFixed(6)} ${pattern} @ $${entryPriceAUD.toFixed(4)} AUD (from Kraken history)`);
     return { symbol, entryPrice, entryPriceAUD, quantity: balance, stopLoss, takeProfit };
@@ -540,13 +581,16 @@ async function getPositionFromKraken(symbol, audPrice, usdtPrice, atr) {
   }
 }
 
-async function placeKrakenOrder(symbol, side, volume) {
-  const path     = "/0/private/AddOrder";
-  const nonce    = Date.now().toString();
-  const postData = new URLSearchParams({
-    nonce, pair: symbol, type: side, ordertype: "market",
+async function placeKrakenOrder(symbol, side, volume, limitPrice = null) {
+  const path   = "/0/private/AddOrder";
+  const nonce  = Date.now().toString();
+  const params = {
+    nonce, pair: symbol, type: side,
+    ordertype: limitPrice ? "limit" : "market",
     volume: parseFloat(volume).toFixed(8),
-  }).toString();
+  };
+  if (limitPrice) params.price = limitPrice.toFixed(6);
+  const postData = new URLSearchParams(params).toString();
 
   const res  = await fetch(`${CONFIG.kraken.baseUrl}${path}`, {
     method: "POST",
@@ -587,8 +631,8 @@ function writeTradeCsv(e) {
     side    = "SELL";
     qty     = e.quantity.toFixed(8);
     total   = e.totalAUD.toFixed(2);
-    fee     = (e.totalAUD * 0.001).toFixed(4);
-    net     = (e.totalAUD - parseFloat(fee)).toFixed(2);
+    fee     = "0.0000";
+    net     = e.totalAUD.toFixed(2);
     orderId = e.orderId || "";
     mode    = e.paperTrading ? "PAPER" : "LIVE";
     const pnl = `${e.pnl >= 0 ? "+" : ""}${e.pnl.toFixed(2)} AUD`;
@@ -602,13 +646,13 @@ function writeTradeCsv(e) {
     side    = "BUY";
     qty     = e.quantity.toFixed(8);
     total   = e.tradeSize.toFixed(2);
-    fee     = (e.tradeSize * 0.001).toFixed(4);
-    net     = (e.tradeSize - parseFloat(fee)).toFixed(2);
+    fee     = "0.0000";
+    net     = e.tradeSize.toFixed(2);
     orderId = e.orderId || "";
     mode    = e.paperTrading ? "PAPER" : "LIVE";
     notes   = e.error
       ? `Error: ${e.error}`
-      : `SL: ${e.stopLossAUD.toFixed(4)} | TP: ${e.takeProfitAUD.toFixed(4)} | Score: ${e.score}/7 | ATR: ${e.indicators.atr.toFixed(4)}`;
+      : `SL: ${e.stopLossAUD.toFixed(4)} | TP: ${e.takeProfitAUD.toFixed(4)} | Score: ${e.score}/8 | ATR: ${e.indicators.atr.toFixed(4)}`;
   }
 
   const row = [date,time,"Kraken",e.symbol,side,qty,e.price.toFixed(2),total,fee,net,orderId,mode,`"${notes}"`].join(",");
@@ -646,13 +690,17 @@ async function evaluateSymbol(symbol, log) {
     return;
   }
 
-  let audPrice;
+  let ticker;
   try {
-    audPrice = await fetchKrakenPrice(symbol);
+    ticker = await fetchKrakenTicker(symbol);
   } catch (err) {
-    console.log(`  ⚠️  Kraken price fetch failed: ${err.message}`);
+    console.log(`  ⚠️  Kraken ticker fetch failed: ${err.message}`);
     return;
   }
+  const audPrice = ticker.last;
+  const audAsk   = ticker.ask;
+  const audBid   = ticker.bid;
+  const audMid   = (audAsk + audBid) / 2;
 
   const closes    = candles.map((c) => c.close);
   const usdtPrice = closes[closes.length - 1];
@@ -670,8 +718,11 @@ async function evaluateSymbol(symbol, log) {
   const supertrend = calcSupertrend(candles);
   const stochRsi   = calcStochRSI(closes);
   const bb         = calcBollingerBands(closes);
+  const avgVolume  = calcVolumeSMA(candles, 20);
+  // Use previous completed bar — current bar volume is always low mid-candle
+  const curVolume  = candles[candles.length - 2].volume;
 
-  console.log(`  Kraken (AUD):   $${audPrice.toFixed(4)}`);
+  console.log(`  Kraken (AUD):   $${audPrice.toFixed(4)} (bid $${audBid.toFixed(4)} / ask $${audAsk.toFixed(4)})`);
   console.log(`  Binance (USDT): $${usdtPrice.toFixed(4)} — indicators only`);
   console.log(`  EMA(8):    $${ema8    ? ema8.toFixed(4)    : "N/A"}`);
   console.log(`  EMA(21):   $${ema21   ? ema21.toFixed(4)   : "N/A"}`);
@@ -684,6 +735,7 @@ async function evaluateSymbol(symbol, log) {
   console.log(`  Supertrend: ${supertrend ? (supertrend.bullish ? "Bullish ▲" : "Bearish ▼") : "N/A"}`);
   console.log(`  StochRSI K/D: ${stochRsi ? stochRsi.k.toFixed(1) + "/" + stochRsi.d.toFixed(1) : "N/A"}`);
   console.log(`  BB lower:  ${bb       ? "$" + bb.lower.toFixed(4) : "N/A"}`);
+  console.log(`  Volume:    ${curVolume.toFixed(0)} (avg ${avgVolume ? avgVolume.toFixed(0) : "N/A"})`);
 
   if (!atr || !vwap) {
     console.log("  ⚠️  Insufficient data. Skipping.");
@@ -693,11 +745,19 @@ async function evaluateSymbol(symbol, log) {
   // ── EXIT: check open position first (live Kraken balance lookup) ────
   const position = await getPositionFromKraken(symbol, audPrice, usdtPrice, atr);
   if (position) {
-    const { shouldExit, reasons } = checkExitConditions(position, usdtPrice, ema8, vwap);
+    // Maintain high-water mark in the log across stateless Railway runs
+    if (!log.highWaterMarks) log.highWaterMarks = {};
+    const savedHwm = log.highWaterMarks[symbol] || position.entryPrice;
+    const hwm = Math.max(savedHwm, usdtPrice);
+    log.highWaterMarks[symbol] = hwm;
+
+    const { shouldExit, reasons } = checkExitConditions(position, usdtPrice, atr, hwm);
     if (!shouldExit) return;
 
-    const totalAUD = position.quantity * audPrice;
-    const pnl      = (audPrice - position.entryPriceAUD) * position.quantity;
+    const totalAUD   = position.quantity * audPrice;
+    const entryTotal = position.quantity * position.entryPriceAUD;
+    const grossPnl   = (audPrice - position.entryPriceAUD) * position.quantity;
+    const pnl        = grossPnl;
     const logEntry = {
       timestamp: new Date().toISOString(), symbol, side: "sell",
       price: audPrice, quantity: position.quantity, totalAUD, pnl,
@@ -725,24 +785,37 @@ async function evaluateSymbol(symbol, log) {
       }
     }
 
-    if (logEntry.orderPlaced) removePosition(log, symbol);
+    if (logEntry.orderPlaced) {
+      removePosition(log, symbol);
+      delete log.highWaterMarks[symbol]; // clear HWM for closed position
+    }
     log.trades.push(logEntry);
     writeTradeCsv(logEntry);
     return;
   }
 
+  // ── ENTRY: guard against duplicate limit orders still open on Kraken ──
+  if (!CONFIG.paperTrading) {
+    const openOrders = await fetchKrakenOpenOrders(symbol);
+    if (openOrders.length > 0) {
+      console.log(`  📋 Open limit order already exists for ${symbol} — skipping entry`);
+      return;
+    }
+  }
+
   // ── ENTRY: 5-layer confluence check ──────────────────────────────────
   const { allPass, score, conditions } = runConfluenceCheck(usdtPrice, {
     ema8, ema21, ema21_3ago, ema200, vwap, rsi14, rsi7, macd, supertrend, stochRsi, bb,
+    curVolume, avgVolume,
   });
 
   const tradeSize    = calcTradeSize(score);
   const quantity     = tradeSize / audPrice;
   const atrPct       = atr / usdtPrice;
   const stopLoss     = usdtPrice - atr * 1.5;
-  const takeProfit   = usdtPrice + atr * 2.5;
+  const takeProfit   = usdtPrice * 1.10;
   const stopLossAUD  = audPrice * (1 - atrPct * 1.5);
-  const takeProfitAUD = audPrice * (1 + atrPct * 2.5);
+  const takeProfitAUD = audPrice * 1.10;
 
   console.log("\n── Decision ─────────────────────────────────────────────\n");
 
@@ -768,22 +841,23 @@ async function evaluateSymbol(symbol, log) {
     console.log(`   Fix: increase portfolio size or remove ${symbol} from SYMBOLS`);
   } else {
     const riskLabel = score >= 7 ? "1.0%" : score >= 6 ? "0.75%" : "0.5%";
-    console.log(`✅ ALL CONDITIONS MET — Score: ${score}/7 (${riskLabel} risk)`);
+    console.log(`✅ ALL CONDITIONS MET — Score: ${score}/8 (${riskLabel} risk)`);
     console.log(`   Trade size:  $${tradeSize.toFixed(2)} AUD`);
     console.log(`   Stop-loss:   $${stopLossAUD.toFixed(4)} AUD (1.5× ATR)`);
-    console.log(`   Take-profit: $${takeProfitAUD.toFixed(4)} AUD (2.5× ATR)`);
+    console.log(`   Take-profit: $${takeProfitAUD.toFixed(4)} AUD (+10%)`);
+    console.log(`   Limit price: $${audMid.toFixed(6)} AUD (mid-price — maker target)`);
 
     if (CONFIG.paperTrading) {
       console.log(`\n📋 PAPER TRADE — ${symbol} qty ${quantity.toFixed(8)} ~$${tradeSize.toFixed(2)} AUD @ $${audPrice.toFixed(4)}`);
       logEntry.orderPlaced = true;
       logEntry.orderId = `PAPER-${Date.now()}`;
     } else {
-      console.log(`\n🔴 PLACING BUY ORDER — ${quantity.toFixed(8)} ${symbol} (~$${tradeSize.toFixed(2)} AUD @ $${audPrice.toFixed(4)} AUD)`);
+      console.log(`\n🔴 PLACING LIMIT BUY — ${quantity.toFixed(8)} ${symbol} (~$${tradeSize.toFixed(2)} AUD) limit $${audMid.toFixed(6)} AUD`);
       try {
-        const order = await placeKrakenOrder(symbol, "buy", quantity);
+        const order = await placeKrakenOrder(symbol, "buy", quantity, audMid);
         logEntry.orderPlaced = true;
         logEntry.orderId = order.orderId;
-        console.log(`✅ BUY ORDER PLACED — ${order.orderId}`);
+        console.log(`✅ BUY ORDER PLACED — ${order.orderId} (limit @ $${audMid.toFixed(6)} AUD)`);
       } catch (err) {
         console.log(`❌ BUY ORDER FAILED — ${err.message}`);
         logEntry.error = err.message;
@@ -815,7 +889,7 @@ async function run() {
   checkOnboarding();
   initCsv();
   console.log("═══════════════════════════════════════════════════════════");
-  console.log("  Claude Trading Bot — Blended Confluence Scalper v2.0");
+  console.log("  Claude Trading Bot — Blended Confluence Scalper v3.0");
   console.log(`  ${new Date().toISOString()}`);
   console.log(`  Mode: ${CONFIG.paperTrading ? "📋 PAPER TRADING" : "🔴 LIVE TRADING"}`);
   console.log("═══════════════════════════════════════════════════════════");
@@ -823,7 +897,7 @@ async function run() {
   const rules = JSON.parse(readFileSync("rules.json", "utf8"));
   console.log(`\nStrategy: ${rules.strategy.name}`);
   console.log(`Symbols (${CONFIG.symbols.length}): ${CONFIG.symbols.join(", ")} | Timeframe: ${CONFIG.timeframe}`);
-  console.log(`Min confluence: 5/7 | Risk: 0.5% (5/7) → 0.75% (6/7) → 1.0% (7/7)`);
+  console.log(`Min confluence: 5/8 | Risk: 0.5% (5-6) → 0.75% (6-7) → 1.0% (7-8)`);
 
   const log = loadLog();
 

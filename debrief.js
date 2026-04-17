@@ -1,6 +1,6 @@
 /**
  * Debrief — sends a market summary + portfolio snapshot to Telegram
- * Runs via Railway cron at 8:30am and 5:30pm AEST (set per-service in dashboard)
+ * Runs via Railway cron at 7am and 5pm AEST (set per-service in dashboard)
  *
  * Covers:
  *   - Open positions: quantity, AUD value, P&L vs entry
@@ -85,12 +85,14 @@ async function fetchKrakenPrice(symbol) {
 // ─── Portfolio (live Kraken balance + trade history) ─────────────────────────
 
 async function fetchPortfolio() {
-  if (!process.env.KRAKEN_API_KEY || !process.env.KRAKEN_API_SECRET) return [];
+  if (!process.env.KRAKEN_API_KEY || !process.env.KRAKEN_API_SECRET) return { positions: [], audCash: 0 };
 
   try {
     const balances = await krakenPrivate("/0/private/Balance");
     const history  = await krakenPrivate("/0/private/TradesHistory");
     const trades = Object.values(history.trades || {});
+
+    const audCash = parseFloat(balances["ZAUD"] || balances["AUD"] || "0");
 
     const positions = [];
     for (const symbol of SYMBOLS) {
@@ -119,10 +121,10 @@ async function fetchPortfolio() {
 
       positions.push({ symbol, balance, currentPrice, valueAUD, entryPrice, pnl, pnlPct });
     }
-    return positions;
+    return { positions, audCash };
   } catch (err) {
     console.warn("Portfolio fetch failed:", err.message);
-    return [];
+    return { positions: [], audCash: 0 };
   }
 }
 
@@ -242,10 +244,11 @@ export async function runDebrief() {
 
   console.log("Generating debrief...");
 
-  const [results, positions] = await Promise.all([
+  const [results, portfolio] = await Promise.all([
     Promise.all(SYMBOLS.map(analyseSymbol)),
     fetchPortfolio(),
   ]);
+  const { positions, audCash } = portfolio;
 
   const now     = new Date();
   const tz      = process.env.TZ || "Australia/Sydney";
@@ -253,7 +256,7 @@ export async function runDebrief() {
   const timeStr = now.toLocaleTimeString("en-AU", { hour: "2-digit", minute: "2-digit", timeZone: tz, timeZoneName: "short" });
 
   const hour        = now.getUTCHours();
-  const isMorning   = hour >= 20 || hour < 10; // 22:30 UTC = 8:30am AEST
+  const isMorning   = hour >= 19 || hour < 9; // 21:00 UTC = 7am AEST
   const label       = isMorning ? "🌅 Morning Debrief" : "🌆 Afternoon Debrief";
   const watching    = results.filter(r => r.ok && r.gatesPass);
   const blocked     = results.filter(r => r.ok && !r.gatesPass);
@@ -286,6 +289,15 @@ export async function runDebrief() {
     const totalEmoji = totalPnl >= 0 ? "📈" : "📉";
     msg += `${totalEmoji} <b>Total: ${fmtAUD(totalValue)} AUD  ·  P&amp;L: ${totalSign}${fmtAUD(totalPnl)} AUD</b>\n`;
   }
+
+  const portfolioTotal = positions.reduce((s, p) => s + p.valueAUD, 0) + audCash;
+  msg += `\n💰 <b>Portfolio Total: ${fmtAUD(portfolioTotal)} AUD</b>`;
+  msg += `  (${fmtAUD(audCash)} AUD cash`;
+  if (positions.length > 0) {
+    const cryptoValue = positions.reduce((s, p) => s + p.valueAUD, 0);
+    msg += ` · ${fmtAUD(cryptoValue)} AUD in crypto`;
+  }
+  msg += `)\n`;
 
   // ── Market Snapshot ────────────────────────────────────────────────────────
   msg += `\n──────────────────────────\n`;

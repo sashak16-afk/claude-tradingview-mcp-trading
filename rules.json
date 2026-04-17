@@ -1,10 +1,10 @@
 {
   "strategy": {
     "name": "Blended Confluence Scalper — Jackson + Multi-Indicator",
-    "version": "2.0",
-    "sources": ["Lewis Jackson (VWAP + RSI(3) + EMA(8))", "Multi-Indicator Confluence (EMA ribbon, BB, Supertrend, MACD, ATR)"],
-    "description": "A 5-layer hierarchy strategy. Each layer must be satisfied before the next is considered. Fast RSI(7) entry timing from Lewis Jackson blended with the EMA ribbon, Supertrend, MACD, and BB confluence system. Minimum 5/7 scored points required to fire a trade. Designed for 1m–5m crypto scalping.",
-    "primary_timeframes": ["1m (execution)", "5m (confirmation)", "15m (context)"],
+    "version": "3.0",
+    "sources": ["Lewis Jackson (VWAP + RSI(3) + EMA(8))", "Multi-Indicator Confluence (EMA ribbon, BB, Supertrend, MACD, ATR, Volume)"],
+    "description": "A 5-layer hierarchy strategy. Each layer must be satisfied before the next is considered. Fast RSI(7) entry timing from Lewis Jackson blended with the EMA ribbon, Supertrend, MACD, BB, and volume confirmation. Minimum 5/8 scored points required to fire a trade. Runs on 30m timeframe. Uses trailing ATR stop to let winners run. Limit orders for entries to target maker fees.",
+    "primary_timeframes": ["30m (execution + confirmation)"],
     "best_assets": ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"]
   },
 
@@ -28,7 +28,7 @@
     "description": "Binary, non-negotiable blockers. ALL must pass or the trade is skipped entirely.",
     "rules": {
       "ema_200_gate": "Long trades ONLY above EMA(200). Short trades ONLY below EMA(200). No exceptions.",
-      "vwap_gate": "Long trades ONLY when price is above VWAP. Short trades ONLY when price is below VWAP. VWAP resets at midnight UTC.",
+      "vwap_gate": "Long trades when price is at or within 0.2% below VWAP. Short trades ONLY when price is below VWAP. VWAP resets at midnight UTC.",
       "rsi14_regime": "RSI(14) above 50 = bullish regime, only take longs. RSI(14) below 50 = bearish regime, only take shorts. If RSI(14) is within 2 points of 50, skip the trade — no clear regime.",
       "vwap_distance": "Do NOT trade if price is more than 1.5% away from VWAP. Overextended = mean reversion risk too high."
     }
@@ -43,27 +43,28 @@
   },
 
   "layer_3_micro_trigger": {
-    "description": "Scored: 2 points available. At least 1/2 required to proceed.",
+    "description": "Scored: 3 points available. At least 1/3 required to proceed.",
     "rules": {
       "ema_cross": "EMA(8) crosses above EMA(21) = +1 long. EMA(8) crosses below EMA(21) = +1 short. This is the primary entry trigger from Lewis Jackson, preserved in full.",
-      "macd_histogram": "MACD (12,26,9) histogram crosses above zero = +1 long. Crosses below zero = +1 short."
+      "macd_histogram": "MACD (12,26,9) histogram crosses above zero = +1 long. Crosses below zero = +1 short.",
+      "volume_confirmation": "Previous completed bar volume > 50% of 20-bar average volume = +1. Uses closed bar to avoid false readings mid-candle. High-volume moves have stronger follow-through and are less likely to be noise."
     }
   },
 
   "layer_4_entry_timing": {
     "description": "Scored: 3 points available. This layer refines the exact candle to enter. At least 1/3 required.",
     "rules": {
-      "rsi_7_entry": "RSI(7) drops below 30 in an uptrend (snap-back setup) = +1 long. RSI(7) spikes above 70 in a downtrend = +1 short. Core concept from Lewis Jackson, upgraded from RSI(3) to RSI(7) for 40% less noise.",
-      "stochrsi_cross": "StochRSI %K crosses above %D from below 20 = +1 long. %K crosses below %D from above 80 = +1 short.",
-      "bollinger_position": "Price near or touching lower Bollinger Band (20,2) in an uptrend = +1 long (mean reversion setup). Price near upper band in a downtrend = +1 short."
+      "rsi_7_entry": "RSI(7) drops below 35 in an uptrend (snap-back setup) = +1 long. RSI(7) spikes above 65 in a downtrend = +1 short. Core concept from Lewis Jackson, upgraded from RSI(3) to RSI(7) for 40% less noise.",
+      "stochrsi_cross": "StochRSI %K crosses above %D from below 50 = +1 long. %K crosses below %D from above 50 = +1 short.",
+      "bollinger_position": "Price within 2% of lower Bollinger Band (20,2) in an uptrend = +1 long (mean reversion setup). Price within 2% of upper band in a downtrend = +1 short."
     }
   },
 
   "minimum_confluence": {
-    "required_score": "5 out of 7 scored points (Layers 2+3+4)",
+    "required_score": "5 out of 8 scored points (Layers 2+3+4)",
     "gates_required": "ALL Layer 1 gates must pass before scoring begins",
-    "high_conviction": "7/7 = maximum size (1% risk). 6/7 = standard size (0.75% risk). 5/7 = reduced size (0.5% risk). Below 5/7 = no trade.",
-    "rationale": "Raising bar from 3/5 to 5/7 using a larger indicator set. Eliminates marginal trades while capturing the best setups."
+    "high_conviction": "7-8/8 = maximum size (1% risk). 6/8 = standard size (0.75% risk). 5/8 = reduced size (0.5% risk). Below 5/8 = no trade.",
+    "rationale": "v3.0: added volume confirmation (+1 pt, Layer 3). Max score raised to 8. Min 5 to fire unchanged."
   },
 
   "setups": {
@@ -122,12 +123,9 @@
 
   "exit_rules": {
     "priority_order": "Apply in this order — first trigger hit closes the trade",
-    "1_hard_stop": "1x ATR(7) below entry for scalps. 1.5x ATR(14) for swing-day trades. Dynamic — does NOT use fixed % stop.",
-    "2_supertrend_flip": "If Supertrend flips against your position, exit immediately. Structural trend break.",
-    "3_rsi7_momentum": "RSI(7) crosses back above 50 for longs (or below 50 for shorts) = momentum exit.",
-    "4_macd_cross": "MACD histogram crosses back below zero for longs (above for shorts) = momentum confirmation of reversal.",
-    "5_vwap_target": "For snap-back trades: take profit at VWAP touch. Do not hold through VWAP without a reason.",
-    "6_ema8_cross": "EMA(8) crosses back below EMA(21) for longs — original Lewis Jackson exit trigger, still valid."
+    "1_hard_stop": "1.5x ATR(14) below entry — hard floor, fires immediately regardless of trend.",
+    "2_take_profit": "10% above entry price — hard ceiling.",
+    "3_trailing_stop": "Trailing stop: high-water-mark − 2.0×ATR(14). Locks in profits as price rises. Replaces the old VWAP+EMA8 trend exit. Lets winners run further while still protecting gains."
   },
 
   "risk_management": {
