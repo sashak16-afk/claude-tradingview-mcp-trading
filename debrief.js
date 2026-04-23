@@ -14,27 +14,28 @@ import crypto from "crypto";
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHAT_ID   = process.env.TELEGRAM_CHAT_ID;
 
-const SYMBOLS = (process.env.SYMBOLS || "XBTAUD,ETHAUD,SOLAUD,XRPAUD,XDGAUD,LINKAUD,SEIUSD,NEARUSD")
+const SYMBOLS = (process.env.SYMBOLS || "XBTAUD,ETHAUD,SOLAUD,XRPAUD,XDGAUD,LINKAUD,ADAAUD,DOTUSD,UNIUSD,ATOMUSD")
   .split(",").map(s => s.trim()).filter(Boolean);
 
 const BINANCE_MAP = {
   XBTAUD:  "BTCUSDT",  ETHAUD:  "ETHUSDT",  SOLAUD:  "SOLUSDT",
   XRPAUD:  "XRPUSDT",  XDGAUD:  "DOGEUSDT", LINKAUD: "LINKUSDT",
-  SEIUSD:  "SEIUSDT",  NEARUSD: "NEARUSDT",
+  ADAAUD:  "ADAUSDT",  DOTUSD:  "DOTUSDT",  UNIUSD:  "UNIUSDT",
+  ATOMUSD: "ATOMUSDT",
 };
 
 // Kraken asset codes for balance lookup
 const KRAKEN_BASE = {
-  XBTAUD: "XXBT", ETHAUD: "XETH",  SOLAUD:  "SOL",
+  XBTAUD: "XXBT", ETHAUD: "XETH",  SOLAUD: "SOL",
   XRPAUD: "XXRP", XDGAUD: "XXDG", LINKAUD: "LINK",
-  SEIUSD: "SEI",  NEARUSD: "NEAR",
+  ADAAUD: "ADA",  DOTUSD: "DOT",  UNIUSD:  "UNI",  ATOMUSD: "ATOM",
 };
 
 // Short string to match pairs in TradesHistory
 const KRAKEN_PAIR_PATTERN = {
-  XBTAUD: "XBT", ETHAUD: "ETH",  SOLAUD:  "SOL",
+  XBTAUD: "XBT", ETHAUD: "ETH",  SOLAUD: "SOL",
   XRPAUD: "XRP", XDGAUD: "XDG", LINKAUD: "LINK",
-  SEIUSD: "SEI", NEARUSD: "NEAR",
+  ADAAUD: "ADA", DOTUSD: "DOT",  UNIUSD: "UNI",  ATOMUSD: "ATOM",
 };
 
 // ─── Market Data (Binance) ────────────────────────────────────────────────────
@@ -160,7 +161,7 @@ function calcVWAP(candles) {
   return vol === 0 ? null : tpv / vol;
 }
 
-function calcSupertrend(candles, period = 10, multiplier = 3.0) {
+function calcSupertrend(candles, period = 10, multiplier = 2.0) {
   if (candles.length < period + 2) return null;
   const trs = [];
   for (let i = 1; i < candles.length; i++) {
@@ -202,12 +203,12 @@ async function analyseSymbol(symbol) {
     const st      = calcSupertrend(candles);
 
     const g1 = ema200 !== null && price > ema200;
-    const g2 = vwap !== null && price > vwap;
-    const g3 = rsi14 !== null && rsi14 > 52;
-    const g4 = vwap ? Math.abs((price - vwap) / vwap) * 100 < 1.5 : false;
-    const gatesPass = g1 && g2 && g3 && g4;
+    const g2 = vwap !== null && Math.abs((price - vwap) / vwap) * 100 <= 0.5;
+    const g3 = rsi14 !== null && rsi14 > 45;
+    const g4 = true; // ADX not checked in debrief (requires more candles)
+    const gatesPass = g1 && g2 && g3;
 
-    return { symbol, price, ema200, vwap, rsi14, st, g1, g2, g3, g4, gatesPass, ok: true };
+    return { symbol, price, ema200, vwap, rsi14, st, g1, g2, g3, gatesPass, ok: true };
   } catch (err) {
     return { symbol, ok: false, error: err.message };
   }
@@ -301,7 +302,7 @@ export async function runDebrief() {
 
   // ── Market Snapshot ────────────────────────────────────────────────────────
   msg += `\n──────────────────────────\n`;
-  msg += `<b>📊 Market Snapshot  (1H)</b>\n\n`;
+  msg += `<b>📊 Market Snapshot  (1H overview)</b>\n\n`;
   for (const r of results) {
     if (!r.ok) { msg += `• <b>${r.symbol}</b>  ⚠️ data unavailable\n`; continue; }
     const trend  = r.st ? (r.st.bullish ? "▲" : "▼") : "─";
@@ -330,17 +331,16 @@ export async function runDebrief() {
     for (const r of topBlocked) {
       const fails = [];
       if (!r.g1) fails.push("below EMA200");
-      if (!r.g2) fails.push("below VWAP");
-      if (!r.g3) fails.push(`RSI14 ${r.rsi14 ? r.rsi14.toFixed(0) : "N/A"} (need >52)`);
-      if (!r.g4) fails.push(">1.5% from VWAP");
+      if (!r.g2) fails.push(`VWAP dist >0.5% (${r.vwap ? (Math.abs((r.price - r.vwap) / r.vwap) * 100).toFixed(2) : "N/A"}%)`);
+      if (!r.g3) fails.push(`RSI14 ${r.rsi14 ? r.rsi14.toFixed(0) : "N/A"} (need >45)`);
       msg += `• <b>${r.symbol}</b>: ${fails.join(", ")}\n`;
     }
   }
 
   // ── Footer ─────────────────────────────────────────────────────────────────
   msg += `\n──────────────────────────\n`;
-  msg += `⚙️ <b>Bot</b>  🔴 LIVE · 1H · ${SYMBOLS.length} symbols · Kraken\n`;
-  msg += `📋 Min confluence: 5/7 · Runs every hour`;
+  msg += `⚙️ <b>Bot v4.0</b>  🔴 LIVE · 15m · ${SYMBOLS.length} symbols · Kraken\n`;
+  msg += `📋 Min confluence: 4/8 · ADX filter · Runs every 15 min`;
 
   await sendTelegram(msg);
   console.log("Debrief sent ✅");
