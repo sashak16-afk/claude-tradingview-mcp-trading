@@ -716,6 +716,16 @@ async function getPositionFromKraken(symbol, audPrice, usdtPrice, atr) {
   }
 }
 
+// Kraken enforces pair-specific tick sizes. Use price magnitude to pick safe precision.
+function krakenPriceStr(price) {
+  if (price >= 10000) return price.toFixed(1);
+  if (price >= 1000)  return price.toFixed(2);
+  if (price >= 100)   return price.toFixed(3);
+  if (price >= 1)     return price.toFixed(4);
+  if (price >= 0.1)   return price.toFixed(5);
+  return price.toFixed(6);
+}
+
 async function placeKrakenOrder(symbol, side, volume, limitPrice = null) {
   const path     = "/0/private/AddOrder";
   const nonce    = Date.now().toString();
@@ -724,7 +734,7 @@ async function placeKrakenOrder(symbol, side, volume, limitPrice = null) {
     ordertype: limitPrice ? "limit" : "market",
     volume: parseFloat(volume).toFixed(8),
   };
-  if (limitPrice) params.price = limitPrice.toFixed(6);
+  if (limitPrice) params.price = krakenPriceStr(limitPrice);
   const postData = new URLSearchParams(params).toString();
 
   const res  = await fetch(`${CONFIG.kraken.baseUrl}${path}`, {
@@ -1000,7 +1010,7 @@ async function evaluateSymbol(symbol, log, bucketPositionCount) {
     console.log(`   Trade size:  $${tradeSize.toFixed(2)} AUD (ATR-sized)`);
     console.log(`   Stop-loss:   $${stopLossAUD.toFixed(4)} AUD (1.5×ATR)`);
     console.log(`   Take-profit: $${takeProfitAUD.toFixed(4)} AUD (4×ATR)`);
-    console.log(`   Limit price: $${audMid.toFixed(6)} AUD (mid-price — maker target)`);
+    console.log(`   Limit price: $${krakenPriceStr(audMid)} AUD (mid-price — maker target)`);
 
     if (CONFIG.paperTrading) {
       console.log(`\n📋 PAPER TRADE — ${symbol} qty ${quantity.toFixed(8)} ~$${tradeSize.toFixed(2)} AUD @ $${audPrice.toFixed(4)}`);
