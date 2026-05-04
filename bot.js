@@ -833,6 +833,23 @@ async function getPosition(symbol, audPrice) {
     return null;
   }
 
+  const entryPriceAUD  = parseFloat(saved.entry_price_aud);
+  const entryPriceUsdt = parseFloat(saved.entry_price_usdt);
+
+  // In paper mode, trust Supabase — no real Kraken balance to verify
+  if (CONFIG.paperTrading) {
+    console.log(`  📋 Open paper position: ${saved.quantity} ${symbol} @ $${entryPriceAUD.toFixed(4)} AUD`);
+    return {
+      symbol,
+      entryPriceAUD,
+      entryPriceUsdt,
+      entryTime:       new Date(saved.entry_time).getTime(),
+      quantity:        parseFloat(saved.quantity),
+      stopLossUsdt:    parseFloat(saved.stop_loss_usdt),
+      takeProfitUsdt:  parseFloat(saved.take_profit_usdt),
+    };
+  }
+
   // Verify position still has balance in Kraken (wasn't manually closed)
   try {
     const balances = await krakenPrivate("/0/private/Balance");
@@ -842,8 +859,6 @@ async function getPosition(symbol, audPrice) {
       await closePosition(symbol);
       return null;
     }
-    const entryPriceAUD  = parseFloat(saved.entry_price_aud);
-    const entryPriceUsdt = parseFloat(saved.entry_price_usdt);
     console.log(`  📂 Open position (bot-owned): ${balance.toFixed(6)} ${symbol} @ $${entryPriceAUD.toFixed(4)} AUD`);
     return {
       symbol,
@@ -1150,7 +1165,7 @@ async function evaluateSymbol(symbol, bucketPositionCount) {
         timestamp: logEntry.timestamp, symbol, side: "buy",
         price_aud: audPrice, quantity, total_aud: tradeSize, score,
         stop_loss_aud: stopLossAUD, take_profit_aud: takeProfitAUD,
-        atr, order_id: logEntry.orderId, mode: "LIVE",
+        atr, order_id: logEntry.orderId, mode: CONFIG.paperTrading ? "PAPER" : "LIVE",
       });
     }
   }
