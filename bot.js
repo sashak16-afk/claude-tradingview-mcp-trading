@@ -1,5 +1,5 @@
 /**
- * Claude + TradingView MCP — Automated Trading Bot v5.0
+ * Claude + TradingView MCP — Automated Trading Bot v6.0
  *
  * Strategy: Blended Confluence Scalper v5.0
  * Timeframe: 1H  |  Cron: 0 * * * *  |  Exchange: Kraken
@@ -93,7 +93,7 @@ const LOG_FILE = "safety-check-log.json";
 const BUCKETS = {
   BTC_BETA:  ["XBTAUD", "ETHAUD", "SOLAUD", "ADAAUD"],
   ALT_BETA:  ["XRPAUD", "XDGAUD", "LINKAUD"],
-  USD_PAIRS: ["DOTUSD", "UNIUSD", "ATOMUSD"],
+  USD_PAIRS: ["DOTUSD", "UNIUSD", "ATOMUSD", "SUIUSD", "AVAXUSD"],
 };
 const MAX_PER_BUCKET = 2;
 
@@ -268,25 +268,28 @@ const QUOTE_CURRENCY = {
   XBTAUD:  "AUD", ETHAUD:  "AUD", SOLAUD:  "AUD", XRPAUD:  "AUD",
   XDGAUD:  "AUD", LINKAUD: "AUD", ADAAUD:  "AUD",
   DOTUSD:  "USD", UNIUSD:  "USD", ATOMUSD: "USD",
+  SUIUSD:  "USD", AVAXUSD: "USD",
 };
 
 const BINANCE_SYMBOL_MAP = {
   XBTAUD: "BTCUSDT",  ETHAUD: "ETHUSDT",  SOLAUD:  "SOLUSDT",
   XRPAUD: "XRPUSDT",  XDGAUD: "DOGEUSDT", LINKAUD: "LINKUSDT",
   ADAAUD: "ADAUSDT",  DOTUSD: "DOTUSDT",  UNIUSD:  "UNIUSDT",
-  ATOMUSD: "ATOMUSDT",
+  ATOMUSD: "ATOMUSDT", SUIUSD: "SUIUSDT", AVAXUSD: "AVAXUSDT",
 };
 
 const KRAKEN_BASE = {
   XBTAUD: "XXBT", ETHAUD: "XETH", SOLAUD: "SOL",
   XRPAUD: "XXRP", XDGAUD: "XXDG", LINKAUD: "LINK",
   ADAAUD: "ADA",  DOTUSD: "DOT",  UNIUSD:  "UNI", ATOMUSD: "ATOM",
+  SUIUSD: "SUI",  AVAXUSD: "AVAX",
 };
 
 const KRAKEN_PAIR_PATTERN = {
   XBTAUD: "XBT", ETHAUD: "ETH", SOLAUD: "SOL",
   XRPAUD: "XRP", XDGAUD: "XDG", LINKAUD: "LINK",
   ADAAUD: "ADA", DOTUSD: "DOT", UNIUSD:  "UNI", ATOMUSD: "ATOM",
+  SUIUSD: "SUI", AVAXUSD: "AVAX",
 };
 
 // Kraken minimum order volumes (in base currency) — from Kraken AssetPairs
@@ -301,6 +304,8 @@ const KRAKEN_MIN_ORDER = {
   DOTUSD:  0.75,
   UNIUSD:  0.25,
   ATOMUSD: 0.25,
+  SUIUSD:  1,
+  AVAXUSD: 0.1,
 };
 
 function toBinanceSymbol(s) {
@@ -786,8 +791,14 @@ async function fetchKrakenOpenOrders(symbol) {
   }
 }
 
-// Kraken tick-size precision
-function krakenPriceStr(price) {
+// Kraken tick-size precision — explicit overrides where Kraken enforces a strict decimal limit
+const KRAKEN_PRICE_DECIMALS = {
+  DOTUSD: 3, UNIUSD: 3, ATOMUSD: 3, SUIUSD: 3, AVAXUSD: 2,
+};
+
+function krakenPriceStr(symbol, price) {
+  const dec = KRAKEN_PRICE_DECIMALS[symbol];
+  if (dec !== undefined) return price.toFixed(dec);
   if (price >= 10000) return price.toFixed(1);
   if (price >= 1000)  return price.toFixed(2);
   if (price >= 100)   return price.toFixed(3);
@@ -804,7 +815,7 @@ async function placeKrakenOrder(symbol, side, volume, limitPrice = null) {
     ordertype: limitPrice ? "limit" : "market",
     volume: parseFloat(volume).toFixed(8),
   };
-  if (limitPrice) params.price = krakenPriceStr(limitPrice);
+  if (limitPrice) params.price = krakenPriceStr(symbol, limitPrice);
   const postData = new URLSearchParams(params).toString();
   const res  = await fetch(`${CONFIG.kraken.baseUrl}${path}`, {
     method: "POST",
@@ -850,22 +861,25 @@ async function getPosition(symbol, audPrice) {
     };
   }
 
-  // Verify position still has balance in Kraken (wasn't manually closed)
+  // Verify position still has balance in Kraken (wasn't manually closed).
+  // Use saved.quantity as the sell quantity — never the raw Kraken balance, which
+  // may include pre-existing holdings the bot did not buy.
   try {
-    const balances = await krakenPrivate("/0/private/Balance");
-    const balance  = parseFloat(balances[KRAKEN_BASE[symbol]] || "0");
+    const balances  = await krakenPrivate("/0/private/Balance");
+    const balance   = parseFloat(balances[KRAKEN_BASE[symbol]] || "0");
+    const savedQty  = parseFloat(saved.quantity);
     if (balance * audPrice < 1.0) {
       console.log(`  ⚠️  ${symbol} position in Supabase but balance is zero — syncing closed`);
       await closePosition(symbol);
       return null;
     }
-    console.log(`  📂 Open position (bot-owned): ${balance.toFixed(6)} ${symbol} @ $${entryPriceAUD.toFixed(4)} AUD`);
+    console.log(`  📂 Open position (bot-owned): ${savedQty.toFixed(6)} ${symbol} @ $${entryPriceAUD.toFixed(4)} AUD`);
     return {
       symbol,
       entryPriceAUD,
       entryPriceUsdt,
       entryTime:       new Date(saved.entry_time).getTime(),
-      quantity:        balance,
+      quantity:        savedQty,
       stopLossUsdt:    parseFloat(saved.stop_loss_usdt),
       takeProfitUsdt:  parseFloat(saved.take_profit_usdt),
     };
@@ -929,6 +943,60 @@ function writeTradeCsv(e) {
   if (!existsSync(CSV_FILE)) writeFileSync(CSV_FILE, CSV_HEADERS + "\n");
   appendFileSync(CSV_FILE, row + "\n");
   console.log(`Tax record saved → ${CSV_FILE}`);
+}
+
+// ─── Liquidate Weakest Position ──────────────────────────────────────────────
+// Called when a buy order fails with insufficient funds. Sells the oldest open
+// position (closest to its 24-bar time stop) to free up capital, then the caller
+// retries the original buy.
+
+async function liquidateWeakest(excludeSymbol) {
+  try {
+    const data = await supabaseSelect(
+      "bot_positions",
+      "is_open=eq.true",
+      "symbol,entry_price_aud,entry_price_usdt,quantity,entry_time"
+    );
+    if (!data || data.length === 0) {
+      console.log("  ⚠️  No open positions to liquidate");
+      return false;
+    }
+    const candidates = data
+      .filter((p) => p.symbol !== excludeSymbol)
+      .sort((a, b) => new Date(a.entry_time) - new Date(b.entry_time));
+    if (candidates.length === 0) {
+      console.log("  ⚠️  No eligible positions to liquidate");
+      return false;
+    }
+    const target   = candidates[0];
+    const ageHours = ((Date.now() - new Date(target.entry_time)) / 3_600_000).toFixed(1);
+    const ticker   = await fetchKrakenTicker(target.symbol);
+    const audPrice = ticker.last;
+    const qty      = parseFloat(target.quantity);
+    const totalAUD = qty * audPrice;
+    const grossPnl = (audPrice - parseFloat(target.entry_price_aud)) * qty;
+    console.log(`  💰 Liquidating ${target.symbol} (${ageHours}h old) to fund ${excludeSymbol} entry`);
+    const order = await placeKrakenOrder(target.symbol, "sell", qty);
+    await closePosition(target.symbol);
+    await saveHWM(target.symbol, 0);
+    await supabaseInsert("bot_trades", {
+      timestamp:    new Date().toISOString(),
+      symbol:       target.symbol,
+      side:         "sell",
+      price_aud:    audPrice,
+      quantity:     qty,
+      total_aud:    totalAUD,
+      pnl:          grossPnl,
+      exit_reasons: `Liquidated to fund ${excludeSymbol} entry`,
+      order_id:     order.orderId,
+      mode:         "LIVE",
+    });
+    console.log(`  ✅ Liquidated ${target.symbol} — ${order.orderId} | P&L: ${grossPnl >= 0 ? "+" : ""}$${grossPnl.toFixed(2)} AUD`);
+    return true;
+  } catch (err) {
+    console.log(`  ⚠️  Liquidation failed: ${err.message}`);
+    return false;
+  }
 }
 
 // ─── Per-symbol Evaluation ────────────────────────────────────────────────────
@@ -1125,22 +1193,41 @@ async function evaluateSymbol(symbol, bucketPositionCount) {
     console.log(`   Trade size:   $${tradeSize.toFixed(2)} AUD (ATR-sized)`);
     console.log(`   Stop-loss:    $${stopLossAUD.toFixed(4)} AUD (1.5×ATR)`);
     console.log(`   Take-profit:  $${takeProfitAUD.toFixed(4)} AUD (3×ATR)`);
-    console.log(`   Limit price:  $${krakenPriceStr(audMid)} AUD (mid-price)`);
+    console.log(`   Limit price:  $${krakenPriceStr(symbol, audMid)} AUD (mid-price)`);
 
     if (CONFIG.paperTrading) {
       console.log(`\n📋 PAPER BUY — ${symbol} qty ${quantity.toFixed(8)} ~$${tradeSize.toFixed(2)} AUD @ $${audPrice.toFixed(4)}`);
       logEntry.orderPlaced = true;
       logEntry.orderId     = `PAPER-${Date.now()}`;
     } else {
-      console.log(`\n🔴 PLACING LIMIT BUY — ${quantity.toFixed(8)} ${symbol} ~$${tradeSize.toFixed(2)} AUD @ limit $${krakenPriceStr(audMid)}`);
+      console.log(`\n🔴 PLACING LIMIT BUY — ${quantity.toFixed(8)} ${symbol} ~$${tradeSize.toFixed(2)} AUD @ limit $${krakenPriceStr(symbol, audMid)}`);
       try {
         const order = await placeKrakenOrder(symbol, "buy", quantity, audMid);
         logEntry.orderPlaced = true;
         logEntry.orderId     = order.orderId;
         console.log(`✅ BUY ORDER PLACED — ${order.orderId}`);
       } catch (err) {
-        console.log(`❌ BUY ORDER FAILED — ${err.message}`);
-        logEntry.error = err.message;
+        if (err.message.includes("Insufficient funds")) {
+          console.log(`⚠️  Insufficient funds — liquidating oldest position to fund entry...`);
+          const liquidated = await liquidateWeakest(symbol);
+          if (liquidated) {
+            try {
+              const order = await placeKrakenOrder(symbol, "buy", quantity, audMid);
+              logEntry.orderPlaced = true;
+              logEntry.orderId     = order.orderId;
+              console.log(`✅ BUY ORDER PLACED (after liquidation) — ${order.orderId}`);
+            } catch (retryErr) {
+              console.log(`❌ BUY ORDER FAILED (after liquidation) — ${retryErr.message}`);
+              logEntry.error = retryErr.message;
+            }
+          } else {
+            console.log(`❌ BUY ORDER FAILED — ${err.message} (no position to liquidate)`);
+            logEntry.error = err.message;
+          }
+        } else {
+          console.log(`❌ BUY ORDER FAILED — ${err.message}`);
+          logEntry.error = err.message;
+        }
       }
     }
 
@@ -1179,7 +1266,7 @@ async function run() {
   checkOnboarding();
   initCsv();
   console.log("═══════════════════════════════════════════════════════════");
-  console.log("  Claude Trading Bot — Blended Confluence Scalper v5.0");
+  console.log("  Claude Trading Bot — Blended Confluence Scalper v6.0");
   console.log(`  ${new Date().toISOString()}`);
   console.log(`  Mode: ${CONFIG.paperTrading ? "📋 PAPER TRADING" : "🔴 LIVE TRADING"}`);
   if (!supabaseReady()) {
