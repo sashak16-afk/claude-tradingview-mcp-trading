@@ -84,7 +84,7 @@ const CONFIG = {
 
 const TF_MAP      = { "1m":1,"3m":3,"5m":5,"15m":15,"30m":30,"1H":60,"4H":240,"1D":1440 };
 const TF_MINUTES  = TF_MAP[CONFIG.timeframe] || 60;
-const TIME_STOP_BARS = Math.ceil(24 * 60 / TF_MINUTES); // 24 bars @ 1H = 24H
+const TIME_STOP_BARS = Math.ceil(8 * 60 / TF_MINUTES); // 8 bars @ 1H = 8H
 
 const LOG_FILE = "safety-check-log.json";
 
@@ -575,17 +575,33 @@ async function cancelStaleOrders() {
     const cutoff  = Date.now() / 1000 - 2 * 3600;
     let cancelled = 0;
     for (const [txid, order] of open) {
-      if (order.descr?.type === "buy" && parseFloat(order.opentm) < cutoff) {
+      const orderType = order.descr?.type;
+      if ((orderType === "buy" || orderType === "sell") && parseFloat(order.opentm) < cutoff) {
         try {
           await krakenPrivate("/0/private/CancelOrder", { txid });
-          console.log(`  🗑️  Cancelled stale buy limit ${txid} (${order.descr?.pair})`);
+          console.log(`  🗑️  Cancelled stale ${orderType} limit ${txid} (${order.descr?.pair})`);
           cancelled++;
+          if (orderType === "sell") {
+            // Stale post-only sell — fall back to market sell so position closes cleanly
+            const sym = CONFIG.symbols.find((s) =>
+              order.descr?.pair?.toUpperCase().includes(KRAKEN_PAIR_PATTERN[s] || "")
+            );
+            if (sym) {
+              const pos = await getOpenPosition(sym);
+              if (pos) {
+                console.log(`  🔴 Market sell fallback for stale ${sym} limit`);
+                await placeKrakenOrder(sym, "sell", parseFloat(pos.quantity), null, true);
+                await closePosition(sym);
+                await saveHWM(sym, 0);
+              }
+            }
+          }
         } catch (err) {
           console.log(`  ⚠️  Cancel failed ${txid}: ${err.message}`);
         }
       }
     }
-    if (cancelled === 0) console.log("  ✅ No stale buy limits to cancel");
+    if (cancelled === 0) console.log("  ✅ No stale limits to cancel");
   } catch (err) {
     console.log(`  ⚠️  Open order check failed: ${err.message}`);
   }
@@ -615,12 +631,12 @@ function runConfluenceCheck(price, indicators) {
     `price ${price.toFixed(4)} vs EMA200 ${ema200 ? ema200.toFixed(4) : "N/A"}`);
 
   // VWAP: null means <4 session bars — skip gate this run
-  const vwapDist = vwap ? Math.abs((price - vwap) / vwap) * 100 : null;
-  const g2 = vwap === null ? true : vwapDist <= 1.5;
+  const vwapDist = vwap ? ((price - vwap) / vwap) * 100 : null;
+  const g2 = vwap === null ? true : (vwapDist >= -0.5 && vwapDist <= 1.5);
   chk(
-    vwap === null ? "VWAP gate skipped — <4 session bars" : "Price within ±1.5% of VWAP",
+    vwap === null ? "VWAP gate skipped — <4 session bars" : "Price within −0.5% to +1.5% of VWAP",
     g2,
-    vwap ? `${vwapDist.toFixed(2)}% from VWAP ${vwap.toFixed(4)}` : "early session"
+    vwap ? `${vwapDist >= 0 ? "+" : ""}${vwapDist.toFixed(2)}% from VWAP ${vwap.toFixed(4)}` : "early session"
   );
 
   const g3 = rsi14 !== null && rsi14 > 45;
@@ -684,15 +700,15 @@ function runConfluenceCheck(price, indicators) {
     bb ? `price ${price.toFixed(4)}, mid ${bb.middle.toFixed(4)} ±1σ ${bb.std.toFixed(4)}` : "N/A");
   if (l4c) score++;
 
-  const allPass = score >= 4;
-  console.log(`\n── Confluence Score: ${score}/8 — ${allPass ? "✅ TRADE SIGNAL" : "🚫 need 4 minimum"}\n`);
+  const allPass = score >= 6;
+  console.log(`\n── Confluence Score: ${score}/8 — ${allPass ? "✅ TRADE SIGNAL" : "🚫 need 6 minimum"}\n`);
   return { allPass, score, conditions, direction: "LONG" };
 }
 
 // ─── Trade Size ───────────────────────────────────────────────────────────────
 
 function calcTradeSize(score, atrPct) {
-  const riskPct  = score >= 7 ? 0.010 : score >= 6 ? 0.0075 : 0.005;
+  const riskPct  = score >= 7 ? 0.010 : 0.005;
   const riskAUD  = CONFIG.portfolioValue * riskPct;
   const stopPct  = atrPct * 1.5;
   const atrSized = stopPct > 0 ? riskAUD / stopPct : CONFIG.minTradeSizeAUD;
@@ -702,15 +718,16 @@ function calcTradeSize(score, atrPct) {
 // ─── Exit Conditions ──────────────────────────────────────────────────────────
 
 function checkExitConditions(position, usdtPrice, atr, hwm) {
-  const trailingStop = hwm - atr * 2.0;
-  const reasons      = [];
+  const trailingStop   = hwm - atr * 3.5;
+  const trailingActive = (hwm - position.entryPriceUsdt) >= atr * 1.0;
+  const reasons        = [];
 
   console.log("\n── Exit Check ───────────────────────────────────────────\n");
   console.log(`  Entry (USDT):   $${position.entryPriceUsdt.toFixed(4)}`);
   console.log(`  Entry (AUD):    $${position.entryPriceAUD.toFixed(4)}`);
   console.log(`  Current (USDT): $${usdtPrice.toFixed(4)}`);
   console.log(`  High-water:     $${hwm.toFixed(4)}`);
-  console.log(`  Trailing stop:  $${trailingStop.toFixed(4)} (HWM − 2.0×ATR)`);
+  console.log(`  Trailing stop:  $${trailingStop.toFixed(4)} (HWM − 3.5×ATR, ${trailingActive ? "active" : "inactive — needs +1×ATR move"})`);
   console.log(`  Hard stop-loss: $${position.stopLossUsdt.toFixed(4)}`);
   console.log(`  Take-profit:    $${position.takeProfitUsdt.toFixed(4)} (3×ATR)`);
 
@@ -718,7 +735,7 @@ function checkExitConditions(position, usdtPrice, atr, hwm) {
     reasons.push(`Hard stop hit (${usdtPrice.toFixed(4)} ≤ ${position.stopLossUsdt.toFixed(4)})`);
   if (usdtPrice >= position.takeProfitUsdt)
     reasons.push(`Take-profit hit (${usdtPrice.toFixed(4)} ≥ ${position.takeProfitUsdt.toFixed(4)})`);
-  if (usdtPrice <= trailingStop)
+  if (trailingActive && usdtPrice <= trailingStop)
     reasons.push(`Trailing stop hit (${usdtPrice.toFixed(4)} ≤ ${trailingStop.toFixed(4)}, HWM ${hwm.toFixed(4)})`);
 
   if (position.entryTime) {
@@ -807,15 +824,36 @@ function krakenPriceStr(symbol, price) {
   return price.toFixed(6);
 }
 
-async function placeKrakenOrder(symbol, side, volume, limitPrice = null) {
-  const path   = "/0/private/AddOrder";
-  const nonce  = Date.now().toString();
+async function placeKrakenOrder(symbol, side, volume, limitPrice = null, forceMarket = false) {
+  const path  = "/0/private/AddOrder";
+  const nonce = Date.now().toString();
+
+  let ordertypeVal  = "market";
+  let resolvedPrice = null;
+  let postOnly      = false;
+
+  if (side === "sell" && !limitPrice && !forceMarket) {
+    // Post-only limit sell at current bid — avoids the 0.26% taker fee.
+    // Expires in 30 min; cancelStaleOrders falls back to market sell if unfilled.
+    const ticker  = await fetchKrakenTicker(symbol);
+    resolvedPrice = ticker.bid;
+    ordertypeVal  = "limit";
+    postOnly      = true;
+    console.log(`  📉 Post-only limit sell @ bid $${krakenPriceStr(symbol, resolvedPrice)} (30m expiry, market fallback next run)`);
+  } else if (limitPrice) {
+    resolvedPrice = limitPrice;
+    ordertypeVal  = "limit";
+  }
+
   const params = {
     nonce, pair: symbol, type: side,
-    ordertype: limitPrice ? "limit" : "market",
+    ordertype: ordertypeVal,
     volume: parseFloat(volume).toFixed(8),
   };
-  if (limitPrice) params.price = krakenPriceStr(symbol, limitPrice);
+  if (resolvedPrice)  params.price    = krakenPriceStr(symbol, resolvedPrice);
+  if (postOnly)       params.oflags   = "post";
+  if (postOnly)       params.expiretm = "+1800";
+
   const postData = new URLSearchParams(params).toString();
   const res  = await fetch(`${CONFIG.kraken.baseUrl}${path}`, {
     method: "POST",
@@ -1067,7 +1105,7 @@ async function evaluateSymbol(symbol, bucketPositionCount) {
     bucketPositionCount[getBucket(symbol)] = (bucketPositionCount[getBucket(symbol)] || 0) + 1;
 
     const savedHwm = await getHWM(symbol);
-    const hwm      = Math.max(savedHwm || 0, usdtPrice, position.entryPriceUsdt * 1.002);
+    const hwm      = Math.max(savedHwm || 0, usdtPrice, position.entryPriceUsdt * 1.0);
     await saveHWM(symbol, hwm);
 
     const { shouldExit, reasons } = checkExitConditions(position, usdtPrice, atr, hwm);
@@ -1114,6 +1152,16 @@ async function evaluateSymbol(symbol, bucketPositionCount) {
       pnl: grossPnl, exit_reasons: reasons.join("; "),
       order_id: logEntry.orderId, mode: CONFIG.paperTrading ? "PAPER" : "LIVE",
     });
+    return;
+  }
+
+  // ── ENTRY: only evaluate on 4H boundary ──────────────────────────────
+  // Hourly entries on chop produce too many marginal trades; evaluating entries
+  // only at 4H boundaries reduces signal noise by 4× without losing real setups.
+  // Exits (above) still run every hour.
+  const utcHour = new Date().getUTCHours();
+  if (utcHour % 4 !== 0) {
+    console.log(`  ⏰ Entry check skipped — only fires on 4H boundary (current UTC ${utcHour}h)`);
     return;
   }
 
@@ -1188,7 +1236,7 @@ async function evaluateSymbol(symbol, bucketPositionCount) {
   } else if (belowMin) {
     console.log(`🚫 TRADE BLOCKED — below Kraken minimum (${quantity.toFixed(4)} < ${minQty} ${symbol})`);
   } else {
-    const riskLabel = score >= 7 ? "1.0%" : score >= 6 ? "0.75%" : "0.5%";
+    const riskLabel = score >= 7 ? "1.0%" : "0.5%";
     console.log(`✅ ALL CONDITIONS MET — Score: ${score}/8 (${riskLabel} risk)`);
     console.log(`   Trade size:   $${tradeSize.toFixed(2)} AUD (ATR-sized)`);
     console.log(`   Stop-loss:    $${stopLossAUD.toFixed(4)} AUD (1.5×ATR)`);
@@ -1278,7 +1326,7 @@ async function run() {
   const rules = JSON.parse(readFileSync("rules.json", "utf8"));
   console.log(`\nStrategy: ${rules.strategy.name}`);
   console.log(`Symbols (${CONFIG.symbols.length}): ${CONFIG.symbols.join(", ")} | TF: ${CONFIG.timeframe}`);
-  console.log(`Min confluence: 4/8 | Risk: 0.5%→0.75%→1.0% | TP: 3×ATR | Time stop: ${TIME_STOP_BARS} bars`);
+  console.log(`Min confluence: 6/8 | Risk: 0.5%/1.0% | TP: 3×ATR | Time stop: ${TIME_STOP_BARS} bars`);
 
   // ── BTC macro regime gate — checked once for all symbols ─────────────
   const btc = await checkBtcRegime();

@@ -61,7 +61,7 @@
   },
 
   "minimum_confluence": {
-    "required_score": "4 out of 8 scored points (Layers 2+3+4)",
+    "required_score": "6 out of 8 scored points (Layers 2+3+4)",
     "gates_required": "ALL Layer 1 gates must pass before scoring begins",
     "high_conviction": "7-8/8 = maximum size (1% risk). 6/8 = standard size (0.75% risk). 4-5/8 = reduced size (0.5% risk). Below 4/8 = no trade.",
     "rationale": "v4.0: lowered threshold from 5 to 4 to unblock entry frequency. Combined with ADX gate, the Layer 1 filter quality is higher, so the scored layers can be more lenient."
@@ -126,7 +126,7 @@
     "1_hard_stop": "1.5×ATR(14) below entry — hard floor, fires immediately.",
     "2_take_profit": "4×ATR(14) above entry — proportional to volatility. Replaces fixed 10% which was too far on 15m.",
     "3_trailing_stop": "Trailing stop: high-water-mark − 2.0×ATR(14). HWM persisted to Supabase (survives Railway redeploys). Cold-start sets HWM = max(saved, current, entry+0.2%).",
-    "4_time_stop": "Close after 96 bars (24 hours on 15m). Frees capital stuck in dead positions."
+    "4_time_stop": "Close after 8 bars (8 hours on 1H). Frees capital faster from dead positions."
   },
 
   "risk_management": {
