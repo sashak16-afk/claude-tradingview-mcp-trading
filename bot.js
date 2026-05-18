@@ -92,8 +92,10 @@ const LOG_FILE = "safety-check-log.json";
 
 const BUCKETS = {
   BTC_BETA:  ["XBTAUD", "ETHAUD", "SOLAUD", "ADAAUD"],
-  ALT_BETA:  ["XRPAUD", "XDGAUD", "LINKAUD"],
-  USD_PAIRS: ["DOTUSD", "UNIUSD", "ATOMUSD", "SUIUSD", "AVAXUSD"],
+  ALT_BETA:  ["XRPAUD", "LINKAUD", "ATOMUSD", "DOTUSD"],
+  MEMES:     ["XDGAUD", "WIFUSD"],
+  NARRATIVE: ["HYPEUSD", "TRXUSD", "TAOUSD", "TONUSD"],
+  USD_PAIRS: ["UNIUSD", "SUIUSD", "AVAXUSD"],
 };
 const MAX_PER_BUCKET = 2;
 
@@ -269,6 +271,8 @@ const QUOTE_CURRENCY = {
   XDGAUD:  "AUD", LINKAUD: "AUD", ADAAUD:  "AUD",
   DOTUSD:  "USD", UNIUSD:  "USD", ATOMUSD: "USD",
   SUIUSD:  "USD", AVAXUSD: "USD",
+  // Phase 2 (inactive until added to SYMBOLS)
+  HYPEUSD: "USD", TRXUSD:  "USD",
 };
 
 const BINANCE_SYMBOL_MAP = {
@@ -276,6 +280,8 @@ const BINANCE_SYMBOL_MAP = {
   XRPAUD: "XRPUSDT",  XDGAUD: "DOGEUSDT", LINKAUD: "LINKUSDT",
   ADAAUD: "ADAUSDT",  DOTUSD: "DOTUSDT",  UNIUSD:  "UNIUSDT",
   ATOMUSD: "ATOMUSDT", SUIUSD: "SUIUSDT", AVAXUSD: "AVAXUSDT",
+  // Phase 2 (inactive until added to SYMBOLS)
+  HYPEUSD: "HYPEUSDT", TRXUSD: "TRXUSDT",
 };
 
 const KRAKEN_BASE = {
@@ -283,6 +289,8 @@ const KRAKEN_BASE = {
   XRPAUD: "XXRP", XDGAUD: "XXDG", LINKAUD: "LINK",
   ADAAUD: "ADA",  DOTUSD: "DOT",  UNIUSD:  "UNI", ATOMUSD: "ATOM",
   SUIUSD: "SUI",  AVAXUSD: "AVAX",
+  // Phase 2 (inactive until added to SYMBOLS)
+  HYPEUSD: "HYPE", TRXUSD: "TRX",
 };
 
 const KRAKEN_PAIR_PATTERN = {
@@ -290,6 +298,8 @@ const KRAKEN_PAIR_PATTERN = {
   XRPAUD: "XRP", XDGAUD: "XDG", LINKAUD: "LINK",
   ADAAUD: "ADA", DOTUSD: "DOT", UNIUSD:  "UNI", ATOMUSD: "ATOM",
   SUIUSD: "SUI", AVAXUSD: "AVAX",
+  // Phase 2 (inactive until added to SYMBOLS)
+  HYPEUSD: "HYPE", TRXUSD: "TRX",
 };
 
 // Kraken minimum order volumes (in base currency) — from Kraken AssetPairs
@@ -306,6 +316,9 @@ const KRAKEN_MIN_ORDER = {
   ATOMUSD: 0.25,
   SUIUSD:  1,
   AVAXUSD: 0.1,
+  // Phase 2 (inactive until added to SYMBOLS — verify on first live use)
+  HYPEUSD: 0.2,
+  TRXUSD:  20,
 };
 
 function toBinanceSymbol(s) {
@@ -553,13 +566,31 @@ async function checkBtcRegime() {
     const ema200     = calcEMA(closed, 200);
     const price      = closed[closed.length - 1];
     const bullish    = ema200 !== null && price > ema200;
+
+    // BTC dominance overlay — fail-open (btcDOver60 = false) if CoinGecko is unavailable
+    let btcDominance = null;
+    let btcDOver60   = false;
+    try {
+      const globalRes = await fetch("https://api.coingecko.com/api/v3/global");
+      if (globalRes.ok) {
+        const globalData = await globalRes.json();
+        btcDominance = globalData.data?.market_cap_percentage?.btc ?? null;
+        if (btcDominance !== null) btcDOver60 = btcDominance > 60;
+      }
+    } catch {
+      // fail-open — btcDOver60 stays false
+    }
+
+    const blockAltLongs = !bullish || btcDOver60;
+
     console.log("\n── BTC Macro Gate ───────────────────────────────────────\n");
     console.log(`  BTC (1H): $${price.toFixed(2)} vs EMA(200): $${ema200 ? ema200.toFixed(2) : "N/A"}`);
     console.log(`  Regime: ${bullish ? "✅ Bullish — longs permitted" : "🚫 Bearish — all new longs blocked"}`);
-    return { bullish, price, ema200 };
+    console.log(`  BTC.D = ${btcDominance !== null ? btcDominance.toFixed(2) + "%" : "N/A (fetch failed)"} | Alt longs: ${blockAltLongs ? "BLOCKED" : "ALLOWED"}`);
+    return { bullish, price, ema200, btcDOver60, blockAltLongs };
   } catch (err) {
     console.log(`  ⚠️  BTC regime check failed: ${err.message} — defaulting to permit`);
-    return { bullish: true };
+    return { bullish: true, btcDOver60: false, blockAltLongs: false };
   }
 }
 
@@ -1343,18 +1374,27 @@ async function run() {
       break;
     }
 
-    // BTC regime blocks new entries only (not exits — handled inside evaluateSymbol)
-    if (!btc.bullish) {
-      // Still run evaluateSymbol so exits are processed; flag BTC block for entry
+    // BTC macro gate — blocks entries, not exits
+    const isBtc = symbol === "XBTAUD";
+    if (isBtc && !btc.bullish) {
       console.log(`\n── ${symbol} — skipping entry (BTC bear regime) ─────────────\n`);
-      // We still need to check exits for open positions
       const ticker = await fetchKrakenTicker(symbol).catch(() => null);
       if (!ticker) continue;
       const position = await getPosition(symbol, ticker.last);
-      if (position) {
-        // Run a lightweight exit check for positions held during regime change
-        await evaluateSymbol(symbol, bucketPositionCount);
-      }
+      if (position) await evaluateSymbol(symbol, bucketPositionCount);
+      continue;
+    }
+    if (!isBtc && btc.blockAltLongs) {
+      const reason = !btc.bullish && btc.btcDOver60
+        ? "BTC.D > 60 + BTC bear regime — alt longs blocked"
+        : btc.btcDOver60
+        ? "BTC.D > 60 — alt longs blocked"
+        : "BTC bear regime — alt longs blocked";
+      console.log(`\n── ${symbol} — skipping entry (${reason}) ─────────────\n`);
+      const ticker = await fetchKrakenTicker(symbol).catch(() => null);
+      if (!ticker) continue;
+      const position = await getPosition(symbol, ticker.last);
+      if (position) await evaluateSymbol(symbol, bucketPositionCount);
       continue;
     }
 
