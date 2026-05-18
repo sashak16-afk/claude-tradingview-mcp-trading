@@ -1563,30 +1563,6 @@ async function run() {
       break;
     }
 
-    // BTC macro gate — blocks entries, not exits
-    const isBtc = symbol === "XBTAUD";
-    if (isBtc && !btc.bullish) {
-      console.log(`\n── ${symbol} — skipping entry (BTC bear regime) ─────────────\n`);
-      const ticker = await fetchKrakenTicker(symbol).catch(() => null);
-      if (!ticker) continue;
-      const position = await getPosition(symbol, ticker.last);
-      if (position) await evaluateSymbol(symbol, bucketPositionCount, btc.btcDominance, fearGreed);
-      continue;
-    }
-    if (!isBtc && btc.blockAltLongs) {
-      const reason = !btc.bullish && btc.btcDOver60
-        ? "BTC.D > 60 + BTC bear regime — alt longs blocked"
-        : btc.btcDOver60
-        ? "BTC.D > 60 — alt longs blocked"
-        : "BTC bear regime — alt longs blocked";
-      console.log(`\n── ${symbol} — skipping entry (${reason}) ─────────────\n`);
-      const ticker = await fetchKrakenTicker(symbol).catch(() => null);
-      if (!ticker) continue;
-      const position = await getPosition(symbol, ticker.last);
-      if (position) await evaluateSymbol(symbol, bucketPositionCount, btc.btcDominance, fearGreed);
-      continue;
-    }
-
     await evaluateSymbol(symbol, bucketPositionCount, btc.btcDominance, fearGreed);
   }
 
