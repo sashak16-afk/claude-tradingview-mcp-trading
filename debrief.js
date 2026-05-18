@@ -257,7 +257,7 @@ function fmtAUD(n) {
 
 // ─── Telegram ─────────────────────────────────────────────────────────────────
 
-async function sendTelegram(text) {
+export async function sendTelegram(text) {
   const res  = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },

@@ -252,6 +252,18 @@ This prints total trades, volume, and fees paid.
 
 ---
 
+## Emergency Killswitch
+
+To halt the bot immediately from anywhere — without a redeploy — set the `killswitch` row in Supabase to `"true"`. The bot checks this at the start of every run and exits before touching any orders or positions.
+
+**To halt:** In your Supabase project → Table Editor → `bot_state`, upsert a row with `key = "killswitch"`, `value = "true"`.
+
+**To resume:** Set `value` back to `"false"`, or delete the row entirely.
+
+This works across Railway deployments instantly — no code change, no push required.
+
+---
+
 ## Safety
 
 The safety check conditions are not fixed — they come directly from your `rules.json`. If you build a strategy from a YouTube trader's transcripts using the Apify prompt, your safety check will reflect that trader's entry logic. If you use the example strategy, it reflects those conditions. They're yours, not a generic filter.

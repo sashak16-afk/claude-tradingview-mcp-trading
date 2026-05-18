@@ -25,6 +25,7 @@ import "dotenv/config";
 import { readFileSync, writeFileSync, existsSync, appendFileSync } from "fs";
 import crypto from "crypto";
 import { execSync } from "child_process";
+import { sendTelegram } from "./debrief.js";
 
 // ─── Onboarding ───────────────────────────────────────────────────────────────
 
@@ -91,13 +92,49 @@ const LOG_FILE = "safety-check-log.json";
 // ─── Correlation Buckets ──────────────────────────────────────────────────────
 
 const BUCKETS = {
-  BTC_BETA:  ["XBTAUD", "ETHAUD", "SOLAUD", "ADAAUD"],
-  ALT_BETA:  ["XRPAUD", "LINKAUD", "ATOMUSD", "DOTUSD"],
-  MEMES:     ["XDGAUD", "WIFUSD"],
-  NARRATIVE: ["HYPEUSD", "TRXUSD", "TAOUSD", "TONUSD"],
-  USD_PAIRS: ["UNIUSD", "SUIUSD", "AVAXUSD"],
+  BTC_BETA:   ["XBTAUD", "ETHAUD", "SOLAUD"],
+  AI_NARR:    ["TAOUSD", "FETUSD"],
+  TREND_LEAD: ["HYPEUSD", "TRXUSD"],
+  MEMES:      ["XDGAUD"],
 };
 const MAX_PER_BUCKET = 2;
+
+// ─── News Blackout Windows ────────────────────────────────────────────────────
+// Entry signals are suppressed during high-impact macro events.
+// VERIFY these dates each month — sources:
+//   NFP/CPI: https://www.bls.gov/schedule/news_release/
+//   FOMC:    https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm
+
+const NEWS_BLACKOUT_WINDOWS = [
+  // NFP (Non-Farm Payrolls) — first Friday of month, 12:30–14:00 UTC
+  ["2026-06-05T12:30:00Z", "2026-06-05T14:00:00Z", "NFP Jun 2026"],
+  ["2026-07-03T12:30:00Z", "2026-07-03T14:00:00Z", "NFP Jul 2026"],
+  // CPI — typically 2nd–3rd week, 12:30–14:00 UTC (est. — verify)
+  ["2026-06-10T12:30:00Z", "2026-06-10T14:00:00Z", "CPI May release Jun 2026 (est.)"],
+  ["2026-07-14T12:30:00Z", "2026-07-14T14:00:00Z", "CPI Jun release Jul 2026 (est.)"],
+  // FOMC statement — ~17:30–20:00 UTC on announcement day (est. — verify)
+  ["2026-06-18T17:30:00Z", "2026-06-18T20:00:00Z", "FOMC Jun 2026 (est.)"],
+  ["2026-07-30T17:30:00Z", "2026-07-30T20:00:00Z", "FOMC Jul 2026 (est.)"],
+];
+
+function isInNewsBlackout() {
+  const now  = new Date();
+  const day  = now.getUTCDay();
+  const hhmm = now.getUTCHours() + now.getUTCMinutes() / 60;
+
+  // Weekly: Sunday 22:00 UTC → Monday 02:00 UTC (weekend liquidity hole)
+  if ((day === 0 && hhmm >= 22) || (day === 1 && hhmm < 2)) {
+    return { blackout: true, label: "Weekend liquidity hole (Sun 22:00–Mon 02:00 UTC)" };
+  }
+
+  const t = now.getTime();
+  for (const [start, end, label] of NEWS_BLACKOUT_WINDOWS) {
+    if (t >= new Date(start).getTime() && t <= new Date(end).getTime()) {
+      return { blackout: true, label };
+    }
+  }
+  return { blackout: false, label: null };
+}
 
 function getBucket(symbol) {
   for (const [name, syms] of Object.entries(BUCKETS)) {
@@ -245,6 +282,23 @@ async function checkDailyLossLimit() {
   return { blocked: dailyPnl <= limit, dailyPnl };
 }
 
+// ─── Daily Profit Lock ────────────────────────────────────────────────────────
+
+async function checkDailyProfitLock() {
+  if (!supabaseReady()) return { locked: false, dailyPnl: 0 };
+  const today      = new Date().toISOString().slice(0, 10);
+  const modeFilter = CONFIG.paperTrading ? "PAPER" : "LIVE";
+  const data = await supabaseSelect(
+    "bot_trades",
+    `timestamp=gte.${today}T00:00:00Z&side=eq.sell&mode=eq.${modeFilter}`,
+    "pnl"
+  );
+  if (!data) return { locked: false, dailyPnl: 0 };
+  const dailyPnl = data.reduce((s, r) => s + (parseFloat(r.pnl) || 0), 0);
+  const target   = CONFIG.portfolioValue * 0.015; // +1.5% daily target
+  return { locked: dailyPnl >= target, dailyPnl };
+}
+
 // ─── Today's Trade Count ──────────────────────────────────────────────────────
 
 async function countTodaysTrades() {
@@ -272,7 +326,7 @@ const QUOTE_CURRENCY = {
   DOTUSD:  "USD", UNIUSD:  "USD", ATOMUSD: "USD",
   SUIUSD:  "USD", AVAXUSD: "USD",
   // Phase 2 (inactive until added to SYMBOLS)
-  HYPEUSD: "USD", TRXUSD:  "USD",
+  HYPEUSD: "USD", TRXUSD:  "USD", TAOUSD: "USD", FETUSD: "USD",
 };
 
 const BINANCE_SYMBOL_MAP = {
@@ -281,7 +335,7 @@ const BINANCE_SYMBOL_MAP = {
   ADAAUD: "ADAUSDT",  DOTUSD: "DOTUSDT",  UNIUSD:  "UNIUSDT",
   ATOMUSD: "ATOMUSDT", SUIUSD: "SUIUSDT", AVAXUSD: "AVAXUSDT",
   // Phase 2 (inactive until added to SYMBOLS)
-  HYPEUSD: "HYPEUSDT", TRXUSD: "TRXUSDT",
+  HYPEUSD: "HYPEUSDT", TRXUSD: "TRXUSDT", TAOUSD: "TAOUSDT", FETUSD: "FETUSDT",
 };
 
 const KRAKEN_BASE = {
@@ -290,7 +344,7 @@ const KRAKEN_BASE = {
   ADAAUD: "ADA",  DOTUSD: "DOT",  UNIUSD:  "UNI", ATOMUSD: "ATOM",
   SUIUSD: "SUI",  AVAXUSD: "AVAX",
   // Phase 2 (inactive until added to SYMBOLS)
-  HYPEUSD: "HYPE", TRXUSD: "TRX",
+  HYPEUSD: "HYPE", TRXUSD: "TRX", TAOUSD: "TAO", FETUSD: "FET",
 };
 
 const KRAKEN_PAIR_PATTERN = {
@@ -299,7 +353,7 @@ const KRAKEN_PAIR_PATTERN = {
   ADAAUD: "ADA", DOTUSD: "DOT", UNIUSD:  "UNI", ATOMUSD: "ATOM",
   SUIUSD: "SUI", AVAXUSD: "AVAX",
   // Phase 2 (inactive until added to SYMBOLS)
-  HYPEUSD: "HYPE", TRXUSD: "TRX",
+  HYPEUSD: "HYPE", TRXUSD: "TRX", TAOUSD: "TAO", FETUSD: "FET",
 };
 
 // Kraken minimum order volumes (in base currency) — from Kraken AssetPairs
@@ -319,6 +373,8 @@ const KRAKEN_MIN_ORDER = {
   // Phase 2 (inactive until added to SYMBOLS — verify on first live use)
   HYPEUSD: 0.2,
   TRXUSD:  20,
+  TAOUSD:  0.05,
+  FETUSD:  10,
 };
 
 function toBinanceSymbol(s) {
@@ -587,10 +643,10 @@ async function checkBtcRegime() {
     console.log(`  BTC (1H): $${price.toFixed(2)} vs EMA(200): $${ema200 ? ema200.toFixed(2) : "N/A"}`);
     console.log(`  Regime: ${bullish ? "✅ Bullish — longs permitted" : "🚫 Bearish — all new longs blocked"}`);
     console.log(`  BTC.D = ${btcDominance !== null ? btcDominance.toFixed(2) + "%" : "N/A (fetch failed)"} | Alt longs: ${blockAltLongs ? "BLOCKED" : "ALLOWED"}`);
-    return { bullish, price, ema200, btcDOver60, blockAltLongs };
+    return { bullish, price, ema200, btcDOver60, blockAltLongs, btcDominance };
   } catch (err) {
     console.log(`  ⚠️  BTC regime check failed: ${err.message} — defaulting to permit`);
-    return { bullish: true, btcDOver60: false, blockAltLongs: false };
+    return { bullish: true, btcDOver60: false, blockAltLongs: false, btcDominance: null };
   }
 }
 
@@ -640,7 +696,7 @@ async function cancelStaleOrders() {
 
 // ─── 5-Layer Confluence Check (v5.0) ─────────────────────────────────────────
 
-function runConfluenceCheck(price, indicators) {
+function runConfluenceCheck(price, indicators, minScore = 6) {
   const {
     ema8, ema21, ema21_3ago, ema200,
     vwap, rsi14, rsi7, adx,
@@ -731,19 +787,32 @@ function runConfluenceCheck(price, indicators) {
     bb ? `price ${price.toFixed(4)}, mid ${bb.middle.toFixed(4)} ±1σ ${bb.std.toFixed(4)}` : "N/A");
   if (l4c) score++;
 
-  const allPass = score >= 6;
-  console.log(`\n── Confluence Score: ${score}/8 — ${allPass ? "✅ TRADE SIGNAL" : "🚫 need 6 minimum"}\n`);
+  const allPass = score >= minScore;
+  console.log(`\n── Confluence Score: ${score}/8 — ${allPass ? "✅ TRADE SIGNAL" : `🚫 need ${minScore} minimum`}\n`);
   return { allPass, score, conditions, direction: "LONG" };
 }
 
 // ─── Trade Size ───────────────────────────────────────────────────────────────
 
-function calcTradeSize(score, atrPct) {
-  const riskPct  = score >= 7 ? 0.010 : 0.005;
-  const riskAUD  = CONFIG.portfolioValue * riskPct;
-  const stopPct  = atrPct * 1.5;
-  const atrSized = stopPct > 0 ? riskAUD / stopPct : CONFIG.minTradeSizeAUD;
-  return Math.max(Math.min(atrSized, CONFIG.maxTradeSizeAUD), CONFIG.minTradeSizeAUD);
+async function calcTradeSize(score, atrPct) {
+  const riskPct         = score >= 7 ? 0.010 : 0.005;
+  const dailyRiskBudget = CONFIG.portfolioValue * 0.02; // 2% of portfolio per day
+
+  const open         = await supabaseSelect("bot_positions", "is_open=eq.true", "entry_price_aud,stop_loss_usdt,quantity");
+  const deployedRisk = (open || []).reduce((s, p) => {
+    const entry = parseFloat(p.entry_price_aud);
+    const stop  = parseFloat(p.stop_loss_usdt);
+    const qty   = parseFloat(p.quantity);
+    return s + Math.abs((entry - stop) * qty);
+  }, 0);
+
+  const remaining = dailyRiskBudget - deployedRisk;
+  if (remaining <= 0) return 0;
+
+  const trialRisk = CONFIG.portfolioValue * riskPct;
+  const useRisk   = Math.min(trialRisk, remaining);
+  const stopPct   = atrPct * 1.5;
+  return stopPct > 0 ? useRisk / stopPct : 0;
 }
 
 // ─── Exit Conditions ──────────────────────────────────────────────────────────
@@ -785,12 +854,27 @@ function checkExitConditions(position, usdtPrice, atr, hwm) {
 // ─── Trade Limits ─────────────────────────────────────────────────────────────
 
 async function checkTradeLimits() {
-  const todayCount = await countTodaysTrades();
   console.log("\n── Trade Limits ─────────────────────────────────────────\n");
+
+  // Circuit breaker — engaged by three-strikes or equity-peak drawdown
+  const cbRow   = await supabaseSelect("bot_state", "key=eq.circuit_breaker_until", "value");
+  const cbUntil = cbRow?.[0]?.value ? new Date(cbRow[0].value) : null;
+  if (cbUntil && cbUntil > new Date()) {
+    console.log(`⛔ Circuit breaker active until ${cbUntil.toISOString()} — entries blocked`);
+    return false;
+  }
+
+  const todayCount = await countTodaysTrades();
 
   const { blocked: lossBlocked, dailyPnl } = await checkDailyLossLimit();
   if (lossBlocked) {
     console.log(`🚫 Daily loss limit hit: ${dailyPnl >= 0 ? "+" : ""}${dailyPnl.toFixed(2)} AUD (limit -3% = -${(CONFIG.portfolioValue * 0.03).toFixed(2)} AUD)`);
+    return false;
+  }
+
+  const { locked: profitLocked, dailyPnl: profitPnl } = await checkDailyProfitLock();
+  if (profitLocked) {
+    console.log(`🔒 Daily profit lock — +${profitPnl.toFixed(2)} AUD already today, no new entries until tomorrow UTC`);
     return false;
   }
 
@@ -1070,7 +1154,7 @@ async function liquidateWeakest(excludeSymbol) {
 
 // ─── Per-symbol Evaluation ────────────────────────────────────────────────────
 
-async function evaluateSymbol(symbol, bucketPositionCount) {
+async function evaluateSymbol(symbol, bucketPositionCount, btcDominance = null, fearGreed = null) {
   console.log(`\n── ${symbol} ─────────────────────────────────────────────\n`);
 
   let allCandles;
@@ -1183,6 +1267,25 @@ async function evaluateSymbol(symbol, bucketPositionCount) {
       pnl: grossPnl, exit_reasons: reasons.join("; "),
       order_id: logEntry.orderId, mode: CONFIG.paperTrading ? "PAPER" : "LIVE",
     });
+
+    // Three-strikes circuit breaker — 3 consecutive losses → 4H cooldown
+    const last3 = await supabaseSelect(
+      "bot_trades",
+      `side=eq.sell&mode=eq.${CONFIG.paperTrading ? "PAPER" : "LIVE"}&order=timestamp.desc&limit=3`,
+      "pnl"
+    );
+    if (last3 && last3.length === 3 && last3.every((t) => parseFloat(t.pnl) < 0)) {
+      const until = new Date(Date.now() + 4 * 3600 * 1000).toISOString();
+      await supabaseUpsert("bot_state", { key: "circuit_breaker_until", value: until, updated_at: new Date().toISOString() }, "key");
+      console.log(`⛔ Three losers in a row — circuit breaker engaged until ${until}`);
+    }
+    return;
+  }
+
+  // ── ENTRY: news blackout ──────────────────────────────────────────────
+  const { blackout, label: blackoutLabel } = isInNewsBlackout();
+  if (blackout) {
+    console.log(`  📰 News blackout — ${blackoutLabel} — skipping entry`);
     return;
   }
 
@@ -1227,35 +1330,39 @@ async function evaluateSymbol(symbol, bucketPositionCount) {
   }
 
   // ── ENTRY: 5-layer confluence ─────────────────────────────────────────
+  // Read dynamic min_confluence_score from Supabase (set by recalibrate.js); default 6
+  let minScore = 6;
+  if (supabaseReady()) {
+    const scoreRow = await supabaseSelect("bot_state", "key=eq.min_confluence_score", "value");
+    if (scoreRow?.[0]?.value) {
+      const parsed = parseInt(scoreRow[0].value);
+      if (!isNaN(parsed)) minScore = Math.min(Math.max(parsed, 4), 8);
+    }
+  }
+
   const { allPass, score, conditions } = runConfluenceCheck(usdtPrice, {
     ema8, ema21, ema21_3ago, ema200, vwap, rsi14, rsi7, adx,
     macd, supertrend, stochRsi, bb, curVolume, medianVolume: medianVol,
-  });
+  }, minScore);
 
   // Entry prices in both USDT space (for stop/TP logic) and AUD (for display/accounting)
-  const isUSD         = QUOTE_CURRENCY[symbol] === "USD";
   const entryPriceUsdt = usdtPrice;
   const entryPriceAUD  = audPrice;
 
   // Stop/TP in USDT space — compared against Binance USDT prices on each run
   const stopLossUsdt   = entryPriceUsdt - atr * 1.5;
-  const takeProfitUsdt = entryPriceUsdt + atr * 3;   // 3×ATR (was 4×ATR)
+  const takeProfitUsdt = entryPriceUsdt + atr * 3;
 
   // AUD equivalents for display — proportional to USDT levels
   const stopLossAUD    = audPrice * (stopLossUsdt   / entryPriceUsdt);
   const takeProfitAUD  = audPrice * (takeProfitUsdt / entryPriceUsdt);
-
-  const tradeSize  = calcTradeSize(score, atrPct);
-  const quantity   = tradeSize / audPrice;
-  const minQty     = KRAKEN_MIN_ORDER[symbol];
-  const belowMin   = minQty && quantity < minQty;
 
   console.log("\n── Decision ─────────────────────────────────────────────\n");
 
   const logEntry = {
     timestamp: new Date().toISOString(), symbol, side: "buy",
     timeframe: CONFIG.timeframe, price: audPrice,
-    atr, conditions, allPass, score, tradeSize, quantity,
+    atr, conditions, allPass, score, tradeSize: 0, quantity: 0,
     stopLossAUD, takeProfitAUD, orderPlaced: false, orderId: null,
     paperTrading: CONFIG.paperTrading,
   };
@@ -1264,9 +1371,20 @@ async function evaluateSymbol(symbol, bucketPositionCount) {
     const failed = conditions.filter((r) => !r.pass).map((r) => r.label);
     console.log("🚫 TRADE BLOCKED");
     failed.forEach((f) => console.log(`   - ${f}`));
-  } else if (belowMin) {
-    console.log(`🚫 TRADE BLOCKED — below Kraken minimum (${quantity.toFixed(4)} < ${minQty} ${symbol})`);
   } else {
+    const tradeSize = await calcTradeSize(score, atrPct);
+    const quantity  = tradeSize / audPrice;
+    const minQty    = KRAKEN_MIN_ORDER[symbol];
+    const belowMin  = minQty && quantity < minQty;
+    const noBudget  = tradeSize === 0;
+    logEntry.tradeSize = tradeSize;
+    logEntry.quantity  = quantity;
+
+    if (noBudget) {
+      console.log(`🚫 TRADE BLOCKED — daily risk budget exhausted`);
+    } else if (belowMin) {
+      console.log(`🚫 TRADE BLOCKED — below Kraken minimum (${quantity.toFixed(4)} < ${minQty} ${symbol})`);
+    } else {
     const riskLabel = score >= 7 ? "1.0%" : "0.5%";
     console.log(`✅ ALL CONDITIONS MET — Score: ${score}/8 (${riskLabel} risk)`);
     console.log(`   Trade size:   $${tradeSize.toFixed(2)} AUD (ATR-sized)`);
@@ -1332,9 +1450,25 @@ async function evaluateSymbol(symbol, bucketPositionCount) {
         price_aud: audPrice, quantity, total_aud: tradeSize, score,
         stop_loss_aud: stopLossAUD, take_profit_aud: takeProfitAUD,
         atr, order_id: logEntry.orderId, mode: CONFIG.paperTrading ? "PAPER" : "LIVE",
+        rationale: JSON.stringify({
+          ema8:       ema8   ? +ema8.toFixed(4)   : null,
+          ema21:      ema21  ? +ema21.toFixed(4)  : null,
+          ema200:     ema200 ? +ema200.toFixed(4) : null,
+          vwap:       vwap   ? +vwap.toFixed(4)   : null,
+          rsi14:      rsi14  ? +rsi14.toFixed(1)  : null,
+          rsi7:       rsi7   ? +rsi7.toFixed(1)   : null,
+          adx:        adx    ? +adx.toFixed(1)    : null,
+          macd_hist:  macd   ? +macd.histogram.toFixed(6) : null,
+          supertrend: supertrend ? (supertrend.bullish ? "bullish" : "bearish") : null,
+          score,
+          atr_pct:    +(atrPct * 100).toFixed(2),
+          btc_d:      btcDominance,
+          fear_greed: fearGreed,
+        }),
       });
     }
-  }
+    } // closes noBudget/belowMin/else
+  } // closes allPass else
 
   writeTradeCsv(logEntry);
 }
@@ -1353,6 +1487,61 @@ async function run() {
     if (!CONFIG.paperTrading) console.log("  ⚠️  Live trading will be blocked until Supabase is set up");
   }
   console.log("═══════════════════════════════════════════════════════════");
+
+  // ── Killswitch — halt everything from Supabase without a redeploy ─────
+  const ks = await supabaseSelect("bot_state", "key=eq.killswitch", "value");
+  if (ks?.[0]?.value === "true") {
+    console.log("☠️  Killswitch ENGAGED in Supabase — exiting without doing anything");
+    return;
+  }
+  console.log("  ✅ Killswitch: off");
+
+  // ── Equity-peak drawdown halt (5% from 30-day peak → 24H circuit breaker) ─
+  console.log("\n── Equity Peak Check ────────────────────────────────────\n");
+  try {
+    const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 3600 * 1000).toISOString();
+    const modeFilter    = CONFIG.paperTrading ? "PAPER" : "LIVE";
+    const tradeHistory  = await supabaseSelect(
+      "bot_trades",
+      `timestamp=gte.${thirtyDaysAgo}&side=eq.sell&mode=eq.${modeFilter}&order=timestamp.asc`,
+      "pnl"
+    );
+    if (tradeHistory && tradeHistory.length > 0) {
+      let runningPeak = 0, running = 0;
+      for (const t of tradeHistory) { running += parseFloat(t.pnl) || 0; if (running > runningPeak) runningPeak = running; }
+      const peakRow    = await supabaseSelect("bot_state", "key=eq.equity_peak", "value");
+      const storedPeak = peakRow?.[0]?.value ? parseFloat(peakRow[0].value) : 0;
+      const peak       = Math.max(runningPeak, storedPeak);
+      if (peak > 0) await supabaseUpsert("bot_state", { key: "equity_peak", value: peak.toString(), updated_at: new Date().toISOString() }, "key");
+      const drawdownPct = peak > 0 ? (peak - running) / peak : 0;
+      console.log(`  Peak (30d): +${peak.toFixed(2)} AUD | Now: ${running >= 0 ? "+" : ""}${running.toFixed(2)} AUD | Drawdown: ${(drawdownPct * 100).toFixed(1)}%`);
+      if (drawdownPct >= 0.05 && peak > 0) {
+        const until = new Date(Date.now() + 24 * 3600 * 1000).toISOString();
+        await supabaseUpsert("bot_state", { key: "circuit_breaker_until", value: until, updated_at: new Date().toISOString() }, "key");
+        console.log(`⚠️  Equity drawdown ≥5% from peak — circuit breaker engaged until ${until}`);
+        try {
+          await sendTelegram(`⚠️ <b>Equity drawdown alert</b>\nBot equity dropped ${(drawdownPct * 100).toFixed(1)}% below its 30-day peak.\nAll new entries blocked for 24 h until ${until}.\nPeak: +${peak.toFixed(2)} AUD | Now: ${running >= 0 ? "+" : ""}${running.toFixed(2)} AUD`);
+        } catch (tgErr) {
+          console.log(`  ⚠️  Telegram alert failed: ${tgErr.message}`);
+        }
+      }
+    } else {
+      console.log(`  No closed trades in last 30 days — skipping drawdown check`);
+    }
+  } catch (err) {
+    console.log(`  ⚠️  Equity peak check failed: ${err.message}`);
+  }
+
+  // ── Fear & Greed Index (fetched once, passed to each symbol) ─────────
+  let fearGreed = null;
+  try {
+    const fgRes = await fetch("https://api.alternative.me/fng/?limit=1");
+    if (fgRes.ok) {
+      const fgData = await fgRes.json();
+      fearGreed = parseInt(fgData.data?.[0]?.value) || null;
+      if (fearGreed !== null) console.log(`\n  Fear & Greed Index: ${fearGreed} (${fgData.data[0].value_classification || ""})`);
+    }
+  } catch { /* fail-open */ }
 
   const rules = JSON.parse(readFileSync("rules.json", "utf8"));
   console.log(`\nStrategy: ${rules.strategy.name}`);
@@ -1381,7 +1570,7 @@ async function run() {
       const ticker = await fetchKrakenTicker(symbol).catch(() => null);
       if (!ticker) continue;
       const position = await getPosition(symbol, ticker.last);
-      if (position) await evaluateSymbol(symbol, bucketPositionCount);
+      if (position) await evaluateSymbol(symbol, bucketPositionCount, btc.btcDominance, fearGreed);
       continue;
     }
     if (!isBtc && btc.blockAltLongs) {
@@ -1394,11 +1583,11 @@ async function run() {
       const ticker = await fetchKrakenTicker(symbol).catch(() => null);
       if (!ticker) continue;
       const position = await getPosition(symbol, ticker.last);
-      if (position) await evaluateSymbol(symbol, bucketPositionCount);
+      if (position) await evaluateSymbol(symbol, bucketPositionCount, btc.btcDominance, fearGreed);
       continue;
     }
 
-    await evaluateSymbol(symbol, bucketPositionCount);
+    await evaluateSymbol(symbol, bucketPositionCount, btc.btcDominance, fearGreed);
   }
 
   saveLog(loadLog()); // persist ephemeral log
