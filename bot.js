@@ -811,8 +811,9 @@ async function calcTradeSize(score, atrPct) {
 
   const trialRisk = CONFIG.portfolioValue * riskPct;
   const useRisk   = Math.min(trialRisk, remaining);
-  const stopPct   = atrPct * 1.5;
-  return stopPct > 0 ? useRisk / stopPct : 0;
+  const stopPct = atrPct * 1.5;
+  const raw     = stopPct > 0 ? useRisk / stopPct : 0;
+  return Math.min(raw, CONFIG.maxTradeSizeAUD);
 }
 
 // ─── Exit Conditions ──────────────────────────────────────────────────────────
