@@ -1514,8 +1514,10 @@ async function run() {
       const storedPeak = peakRow?.[0]?.value ? parseFloat(peakRow[0].value) : 0;
       const peak       = Math.max(runningPeak, storedPeak);
       if (peak > 0) await supabaseUpsert("bot_state", { key: "equity_peak", value: peak.toString(), updated_at: new Date().toISOString() }, "key");
-      const drawdownPct = peak > 0 ? (peak - running) / peak : 0;
-      console.log(`  Peak (30d): +${peak.toFixed(2)} AUD | Now: ${running >= 0 ? "+" : ""}${running.toFixed(2)} AUD | Drawdown: ${(drawdownPct * 100).toFixed(1)}%`);
+      // Drawdown as % of portfolio value — prevents false triggers when P&L peak is tiny
+      const drawdownAUD = peak - running;
+      const drawdownPct = drawdownAUD / CONFIG.portfolioValue;
+      console.log(`  Peak (30d): +${peak.toFixed(2)} AUD | Now: ${running >= 0 ? "+" : ""}${running.toFixed(2)} AUD | Drawdown: ${drawdownAUD.toFixed(2)} AUD (${(drawdownPct * 100).toFixed(1)}% of portfolio)`);
       if (drawdownPct >= 0.05 && peak > 0) {
         const until = new Date(Date.now() + 24 * 3600 * 1000).toISOString();
         await supabaseUpsert("bot_state", { key: "circuit_breaker_until", value: until, updated_at: new Date().toISOString() }, "key");
