@@ -1,11 +1,11 @@
 {
   "strategy": {
     "name": "Blended Confluence Scalper — Jackson + Multi-Indicator",
-    "version": "4.0",
+    "version": "7.0",
     "sources": ["Lewis Jackson (VWAP + RSI + EMA(8))", "Multi-Indicator Confluence (EMA ribbon, BB, Supertrend, MACD, ATR, ADX, Volume)"],
     "description": "A 5-layer hierarchy strategy running on 15m candles. ADX(14) > 20 confirms trending market conditions before any entry. VWAP gate loosened to ±0.5% symmetric. RSI7 entry window widened to 45-65 (pullback in uptrend, not capitulation). StochRSI condition simplified to %K > %D and < 80. BB condition checks mid-range positioning. Volume uses 20-bar median. Minimum 4/8 scored points. Take-profit at 4×ATR. ATR-based position sizing. 24H time stop.",
     "primary_timeframes": ["15m (execution + confirmation)"],
-    "best_assets": ["XBTAUD", "ETHAUD", "SOLAUD", "XRPAUD", "XDGAUD", "LINKAUD", "ADAAUD", "DOTUSD", "UNIUSD", "ATOMUSD"]
+    "best_assets": ["XBTAUD", "ETHAUD", "SOLAUD", "XDGAUD", "AVAXUSD", "SUIUSD", "ADAAUD", "XRPAUD"]
   },
 
   "watchlist": [
@@ -61,10 +61,10 @@
   },
 
   "minimum_confluence": {
-    "required_score": "6 out of 8 scored points (Layers 2+3+4)",
+    "required_score": "6 out of 8 scored points (Layers 2+3+4) — hard floor, cannot be lowered by recalibrate.js",
     "gates_required": "ALL Layer 1 gates must pass before scoring begins",
-    "high_conviction": "7-8/8 = maximum size (1% risk). 6/8 = standard size (0.75% risk). 4-5/8 = reduced size (0.5% risk). Below 4/8 = no trade.",
-    "rationale": "v4.0: lowered threshold from 5 to 4 to unblock entry frequency. Combined with ADX gate, the Layer 1 filter quality is higher, so the scored layers can be more lenient."
+    "high_conviction": "7-8/8 = maximum size (8% risk, capped at 30% of portfolio). 6/8 = standard size (4% risk, capped at 30% of portfolio). Below 6/8 = no trade.",
+    "rationale": "v7.0: raised risk from 0.5%/1% to 4%/8% to support 20x portfolio goal. Score floor hardened to 6 (was 4 in v4.0). Trade size capped at 30% of portfolio."
   },
 
   "setups": {
@@ -124,21 +124,20 @@
   "exit_rules": {
     "priority_order": "Apply in this order — first trigger hit closes the trade",
     "1_hard_stop": "1.5×ATR(14) below entry — hard floor, fires immediately.",
-    "2_take_profit": "4×ATR(14) above entry — proportional to volatility. Replaces fixed 10% which was too far on 15m.",
-    "3_trailing_stop": "Trailing stop: high-water-mark − 2.0×ATR(14). HWM persisted to Supabase (survives Railway redeploys). Cold-start sets HWM = max(saved, current, entry+0.2%).",
-    "4_time_stop": "Close after 8 bars (8 hours on 1H). Frees capital faster from dead positions."
+    "2_take_profit": "5×ATR(14) above entry — widened from 3×ATR to let winners run toward 20x goal.",
+    "3_trailing_stop": "Trailing stop: high-water-mark − 3.5×ATR(14). HWM persisted to Supabase (survives Railway redeploys). Cold-start sets HWM = max(saved, current, entry+0.2%).",
+    "4_time_stop": "Close after 48 bars (48 hours on 1H). Extended from 8H to give positions room to develop."
   },
 
   "risk_management": {
     "risk_per_trade": {
-      "7_of_7": "1.0% of account (maximum — reserved for perfect confluence)",
-      "6_of_7": "0.75% of account",
-      "5_of_7": "0.5% of account (minimum — do not go below this or the trade isn't worth taking)"
+      "7_or_8_of_8": "8% of account risk, capped at 30% of portfolio per position",
+      "6_of_8": "4% of account risk, capped at 30% of portfolio per position"
     },
-    "stop_sizing": "ATR-based only. Stop = 1x ATR(7) for scalps (1m-5m), 1.5x ATR(14) for day trades (15m+). Never use a fixed % stop — it doesn't adapt to volatility.",
-    "minimum_rr": "1.5:1 for RSI(7) snap-back scalps. 2:1 for EMA cross and Supertrend trades. 2.5:1 for BB squeeze breakouts.",
-    "simultaneous_positions": "Maximum 2% of account in open scalp positions at any one time.",
-    "daily_loss_limit": "Hard stop at -3% account drawdown for the day. Close all positions. Walk away.",
+    "stop_sizing": "ATR-based only. Stop = 1.5x ATR(14) on all 1H trades. Never use a fixed % stop — it doesn't adapt to volatility.",
+    "minimum_rr": "3.33:1 (5×ATR TP vs 1.5×ATR stop). Liquidation of existing positions to fund new entries is DISABLED.",
+    "simultaneous_positions": "Daily risk budget 20% of portfolio. Max 30% per position. Bucket cap: 2 positions per correlation bucket.",
+    "daily_loss_limit": "Hard stop at -10% account drawdown for the day. Close all positions. Walk away.",
     "high_volatility_rule": "If ATR(14) is in the top 20% of its 30-day range, cut all position sizes by 50%.",
     "low_volatility_rule": "BB squeeze detected + ATR contracting = allowed to size up to 1.25x normal (highest edge setup).",
     "overextension_rule": "Do not enter if price is more than 1.5% from VWAP. Wait for reversion before trading.",

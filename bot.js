@@ -85,7 +85,7 @@ const CONFIG = {
 
 const TF_MAP      = { "1m":1,"3m":3,"5m":5,"15m":15,"30m":30,"1H":60,"4H":240,"1D":1440 };
 const TF_MINUTES  = TF_MAP[CONFIG.timeframe] || 60;
-const TIME_STOP_BARS = Math.ceil(8 * 60 / TF_MINUTES); // 8 bars @ 1H = 8H
+const TIME_STOP_BARS = Math.ceil(48 * 60 / TF_MINUTES); // 48 bars @ 1H = 48H
 
 const LOG_FILE = "safety-check-log.json";
 
@@ -278,7 +278,7 @@ async function checkDailyLossLimit() {
   );
   if (!data) return { blocked: false, dailyPnl: 0 };
   const dailyPnl = data.reduce((s, r) => s + (parseFloat(r.pnl) || 0), 0);
-  const limit    = CONFIG.portfolioValue * -0.03;
+  const limit    = CONFIG.portfolioValue * -0.10;
   return { blocked: dailyPnl <= limit, dailyPnl };
 }
 
@@ -295,7 +295,7 @@ async function checkDailyProfitLock() {
   );
   if (!data) return { locked: false, dailyPnl: 0 };
   const dailyPnl = data.reduce((s, r) => s + (parseFloat(r.pnl) || 0), 0);
-  const target   = CONFIG.portfolioValue * 0.015; // +1.5% daily target
+  const target   = CONFIG.portfolioValue * 0.10; // +10% daily target
   return { locked: dailyPnl >= target, dailyPnl };
 }
 
@@ -795,8 +795,8 @@ function runConfluenceCheck(price, indicators, minScore = 6) {
 // ─── Trade Size ───────────────────────────────────────────────────────────────
 
 async function calcTradeSize(score, atrPct) {
-  const riskPct         = score >= 7 ? 0.010 : 0.005;
-  const dailyRiskBudget = CONFIG.portfolioValue * 0.02; // 2% of portfolio per day
+  const riskPct         = score >= 7 ? 0.08 : 0.04;
+  const dailyRiskBudget = CONFIG.portfolioValue * 0.20; // 20% of portfolio per day
 
   const open         = await supabaseSelect("bot_positions", "is_open=eq.true", "entry_price_aud,stop_loss_usdt,quantity");
   const deployedRisk = (open || []).reduce((s, p) => {
@@ -813,7 +813,7 @@ async function calcTradeSize(score, atrPct) {
   const useRisk   = Math.min(trialRisk, remaining);
   const stopPct = atrPct * 1.5;
   const raw     = stopPct > 0 ? useRisk / stopPct : 0;
-  return Math.min(raw, CONFIG.maxTradeSizeAUD);
+  return Math.min(raw, CONFIG.portfolioValue * 0.30); // cap at 30% of portfolio per position
 }
 
 // ─── Exit Conditions ──────────────────────────────────────────────────────────
@@ -869,7 +869,7 @@ async function checkTradeLimits() {
 
   const { blocked: lossBlocked, dailyPnl } = await checkDailyLossLimit();
   if (lossBlocked) {
-    console.log(`🚫 Daily loss limit hit: ${dailyPnl >= 0 ? "+" : ""}${dailyPnl.toFixed(2)} AUD (limit -3% = -${(CONFIG.portfolioValue * 0.03).toFixed(2)} AUD)`);
+    console.log(`🚫 Daily loss limit hit: ${dailyPnl >= 0 ? "+" : ""}${dailyPnl.toFixed(2)} AUD (limit -10% = -${(CONFIG.portfolioValue * 0.10).toFixed(2)} AUD)`);
     return false;
   }
 
@@ -1337,7 +1337,7 @@ async function evaluateSymbol(symbol, bucketPositionCount, btcDominance = null, 
     const scoreRow = await supabaseSelect("bot_state", "key=eq.min_confluence_score", "value");
     if (scoreRow?.[0]?.value) {
       const parsed = parseInt(scoreRow[0].value);
-      if (!isNaN(parsed)) minScore = Math.min(Math.max(parsed, 4), 8);
+      if (!isNaN(parsed)) minScore = Math.min(Math.max(parsed, 6), 8);
     }
   }
 
@@ -1352,7 +1352,7 @@ async function evaluateSymbol(symbol, bucketPositionCount, btcDominance = null, 
 
   // Stop/TP in USDT space — compared against Binance USDT prices on each run
   const stopLossUsdt   = entryPriceUsdt - atr * 1.5;
-  const takeProfitUsdt = entryPriceUsdt + atr * 3;
+  const takeProfitUsdt = entryPriceUsdt + atr * 5;
 
   // AUD equivalents for display — proportional to USDT levels
   const stopLossAUD    = audPrice * (stopLossUsdt   / entryPriceUsdt);
@@ -1390,7 +1390,7 @@ async function evaluateSymbol(symbol, bucketPositionCount, btcDominance = null, 
     console.log(`✅ ALL CONDITIONS MET — Score: ${score}/8 (${riskLabel} risk)`);
     console.log(`   Trade size:   $${tradeSize.toFixed(2)} AUD (ATR-sized)`);
     console.log(`   Stop-loss:    $${stopLossAUD.toFixed(4)} AUD (1.5×ATR)`);
-    console.log(`   Take-profit:  $${takeProfitAUD.toFixed(4)} AUD (3×ATR)`);
+    console.log(`   Take-profit:  $${takeProfitAUD.toFixed(4)} AUD (5×ATR)`);
     console.log(`   Limit price:  $${krakenPriceStr(symbol, audMid)} AUD (mid-price)`);
 
     if (CONFIG.paperTrading) {
@@ -1406,26 +1406,11 @@ async function evaluateSymbol(symbol, bucketPositionCount, btcDominance = null, 
         console.log(`✅ BUY ORDER PLACED — ${order.orderId}`);
       } catch (err) {
         if (err.message.includes("Insufficient funds")) {
-          console.log(`⚠️  Insufficient funds — liquidating oldest position to fund entry...`);
-          const liquidated = await liquidateWeakest(symbol);
-          if (liquidated) {
-            try {
-              const order = await placeKrakenOrder(symbol, "buy", quantity, audMid);
-              logEntry.orderPlaced = true;
-              logEntry.orderId     = order.orderId;
-              console.log(`✅ BUY ORDER PLACED (after liquidation) — ${order.orderId}`);
-            } catch (retryErr) {
-              console.log(`❌ BUY ORDER FAILED (after liquidation) — ${retryErr.message}`);
-              logEntry.error = retryErr.message;
-            }
-          } else {
-            console.log(`❌ BUY ORDER FAILED — ${err.message} (no position to liquidate)`);
-            logEntry.error = err.message;
-          }
+          console.log(`⚠️  Insufficient funds — skipping entry (liquidation disabled to protect existing positions)`);
         } else {
           console.log(`❌ BUY ORDER FAILED — ${err.message}`);
-          logEntry.error = err.message;
         }
+        logEntry.error = err.message;
       }
     }
 
@@ -1549,7 +1534,7 @@ async function run() {
   const rules = JSON.parse(readFileSync("rules.json", "utf8"));
   console.log(`\nStrategy: ${rules.strategy.name}`);
   console.log(`Symbols (${CONFIG.symbols.length}): ${CONFIG.symbols.join(", ")} | TF: ${CONFIG.timeframe}`);
-  console.log(`Min confluence: 6/8 | Risk: 0.5%/1.0% | TP: 3×ATR | Time stop: ${TIME_STOP_BARS} bars`);
+  console.log(`Min confluence: 6/8 | Risk: 4%/8% | TP: 5×ATR | Time stop: ${TIME_STOP_BARS} bars`);
 
   // ── BTC macro regime gate — checked once for all symbols ─────────────
   const btc = await checkBtcRegime();
