@@ -22,19 +22,22 @@ const BINANCE_MAP = {
   XBTAUD:  "BTCUSDT",  ETHAUD:  "ETHUSDT",  SOLAUD:  "SOLUSDT",
   XRPAUD:  "XRPUSDT",  XDGAUD:  "DOGEUSDT", LINKAUD: "LINKUSDT",
   ADAAUD:  "ADAUSDT",  DOTUSD:  "DOTUSDT",  UNIUSD:  "UNIUSDT",
-  ATOMUSD: "ATOMUSDT",
+  ATOMUSD: "ATOMUSDT", SUIUSD:  "SUIUSDT",  AVAXUSD: "AVAXUSDT",
+  LINKUSD: "LINKUSDT", PEPEUSD: "PEPEUSDT",
 };
 
 const KRAKEN_BASE = {
   XBTAUD: "XXBT", ETHAUD: "XETH",  SOLAUD: "SOL",
   XRPAUD: "XXRP", XDGAUD: "XXDG", LINKAUD: "LINK",
   ADAAUD: "ADA",  DOTUSD: "DOT",  UNIUSD:  "UNI",  ATOMUSD: "ATOM",
+  SUIUSD: "SUI",  AVAXUSD: "AVAX", LINKUSD: "LINK", PEPEUSD: "PEPE",
 };
 
 const KRAKEN_PAIR_PATTERN = {
   XBTAUD: "XBT", ETHAUD: "ETH",  SOLAUD: "SOL",
   XRPAUD: "XRP", XDGAUD: "XDG", LINKAUD: "LINK",
   ADAAUD: "ADA", DOTUSD: "DOT",  UNIUSD: "UNI",  ATOMUSD: "ATOM",
+  SUIUSD: "SUI", AVAXUSD: "AVAX", LINKUSD: "LINK", PEPEUSD: "PEPE",
 };
 
 // ─── Market Data ──────────────────────────────────────────────────────────────
@@ -172,35 +175,42 @@ async function fetchPortfolio() {
   if (!process.env.KRAKEN_API_KEY || !process.env.KRAKEN_API_SECRET) return { positions: [], audCash: 0 };
 
   try {
-    // Get bot-owned positions from Supabase (not raw Kraken balance)
     const [balances, supabasePositions] = await Promise.all([
       krakenPrivate("/0/private/Balance"),
       fetchSupabasePositions(),
     ]);
 
-    const audCash   = parseFloat(balances["ZAUD"] || balances["AUD"] || "0");
+    const audCash = parseFloat(balances["ZAUD"] || balances["AUD"] || "0");
     const positions = [];
+    const seen = new Set(); // avoid double-counting assets shared by two symbol keys
 
-    for (const pos of supabasePositions) {
-      const symbol   = pos.symbol;
-      const base     = KRAKEN_BASE[symbol];
-      if (!base) continue;
+    const supabaseBySymbol = {};
+    for (const pos of supabasePositions) supabaseBySymbol[pos.symbol] = pos;
 
+    for (const [symbol, base] of Object.entries(KRAKEN_BASE)) {
+      if (seen.has(base)) continue;
       const balance = parseFloat(balances[base] || "0");
       if (balance <= 0) continue;
 
       let currentPrice;
       try { currentPrice = await fetchKrakenPrice(symbol); } catch { continue; }
 
-      const valueAUD   = balance * currentPrice;
+      const valueAUD = balance * currentPrice;
       if (valueAUD < 1.0) continue;
 
-      const entryPrice = parseFloat(pos.entry_price_aud);
-      const costBasis  = entryPrice * balance;
-      const pnl        = valueAUD - costBasis;
-      const pnlPct     = costBasis > 0 ? (pnl / costBasis) * 100 : 0;
+      seen.add(base);
 
-      positions.push({ symbol, balance, currentPrice, valueAUD, entryPrice, pnl, pnlPct });
+      const pos = supabaseBySymbol[symbol];
+      if (pos) {
+        const entryPrice = parseFloat(pos.entry_price_aud);
+        const costBasis  = entryPrice * balance;
+        const pnl        = valueAUD - costBasis;
+        const pnlPct     = costBasis > 0 ? (pnl / costBasis) * 100 : 0;
+        positions.push({ symbol, balance, currentPrice, valueAUD, entryPrice, pnl, pnlPct, botTracked: true });
+      } else {
+        // Coin held on Kraken but not opened by the bot (manual hold)
+        positions.push({ symbol, balance, currentPrice, valueAUD, entryPrice: null, pnl: null, pnlPct: null, botTracked: false });
+      }
     }
     return { positions, audCash };
   } catch (err) {
@@ -315,22 +325,34 @@ export async function runDebrief() {
   if (positions.length === 0) {
     msg += `<i>No open positions</i>\n`;
   } else {
-    const totalValue = positions.reduce((s, p) => s + p.valueAUD, 0);
-    const totalPnl   = positions.reduce((s, p) => s + p.pnl, 0);
-
     for (const p of positions) {
-      const sign  = p.pnl >= 0 ? "+" : "";
-      const emoji = p.pnl >= 0 ? "🟢" : "🔴";
-      const qty   = p.balance < 1 ? p.balance.toFixed(6) : p.balance.toFixed(2);
-      msg += `${emoji} <b>${p.symbol}</b>\n`;
-      msg += `   ${qty} units · now ${fmtAUD(p.currentPrice)}\n`;
-      msg += `   Value: <b>${fmtAUD(p.valueAUD)} AUD</b>  ·  Entry: ${fmtAUD(p.entryPrice)}\n`;
-      msg += `   P&amp;L: <b>${sign}${fmtAUD(p.pnl)} AUD</b>  (${sign}${p.pnlPct.toFixed(1)}%)\n\n`;
+      const qty = p.balance >= 1_000_000
+        ? p.balance.toLocaleString("en-AU", { maximumFractionDigits: 0 })
+        : p.balance < 1 ? p.balance.toFixed(6) : p.balance.toFixed(2);
+      if (p.botTracked) {
+        const sign  = p.pnl >= 0 ? "+" : "";
+        const emoji = p.pnl >= 0 ? "🟢" : "🔴";
+        msg += `${emoji} <b>${p.symbol}</b>\n`;
+        msg += `   ${qty} units · now ${fmtAUD(p.currentPrice)}\n`;
+        msg += `   Value: <b>${fmtAUD(p.valueAUD)} AUD</b>  ·  Entry: ${fmtAUD(p.entryPrice)}\n`;
+        msg += `   P&amp;L: <b>${sign}${fmtAUD(p.pnl)} AUD</b>  (${sign}${p.pnlPct.toFixed(1)}%)\n\n`;
+      } else {
+        msg += `⚪ <b>${p.symbol}</b>  <i>(manual hold)</i>\n`;
+        msg += `   ${qty} units · now ${fmtAUD(p.currentPrice)}\n`;
+        msg += `   Value: <b>${fmtAUD(p.valueAUD)} AUD</b>\n\n`;
+      }
     }
 
-    const sign  = totalPnl >= 0 ? "+" : "";
-    const emoji = totalPnl >= 0 ? "📈" : "📉";
-    msg += `${emoji} <b>Total: ${fmtAUD(positions.reduce((s, p) => s + p.valueAUD, 0))} AUD  ·  P&amp;L: ${sign}${fmtAUD(totalPnl)} AUD</b>\n`;
+    const totalValue = positions.reduce((s, p) => s + p.valueAUD, 0);
+    const tracked    = positions.filter((p) => p.botTracked);
+    if (tracked.length > 0) {
+      const totalPnl = tracked.reduce((s, p) => s + p.pnl, 0);
+      const sign  = totalPnl >= 0 ? "+" : "";
+      const emoji = totalPnl >= 0 ? "📈" : "📉";
+      msg += `${emoji} <b>Total: ${fmtAUD(totalValue)} AUD  ·  Bot P&amp;L: ${sign}${fmtAUD(totalPnl)} AUD</b>\n`;
+    } else {
+      msg += `📊 <b>Total: ${fmtAUD(totalValue)} AUD</b>\n`;
+    }
   }
 
   const portfolioTotal = positions.reduce((s, p) => s + p.valueAUD, 0) + audCash;
